@@ -1,0 +1,70 @@
+using System.Text.Json;
+
+namespace DotnetAgentFramework;
+
+/// <summary>
+/// A capability the agent can invoke: a function with a name, a description and a JSON argument schema.
+/// Implementations should be stateless or thread-safe, because a single instance may serve
+/// concurrent agent runs.
+/// </summary>
+public interface ITool
+{
+    /// <summary>
+    /// Definition exposed to the model: name, description and JSON Schema for the arguments.
+    /// </summary>
+    ToolDefinition Definition { get; }
+
+    /// <summary>
+    /// Executes the tool with the arguments chosen by the model.
+    /// </summary>
+    /// <param name="arguments">Arguments as a JSON object matching <see cref="ToolDefinition.ParametersSchema"/>.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>
+    /// A string result fed back to the model. Errors that the model should be able to recover from
+    /// (bad arguments, not found, ...) should be returned as text rather than thrown.
+    /// </returns>
+    Task<string> InvokeAsync(JsonElement arguments, CancellationToken cancellationToken = default);
+}
+
+/// <summary>
+/// Strongly-typed convenience base for tools. Arguments are deserialized into <typeparamref name="TArgs"/>
+/// and the JSON Schema is derived from its shape.
+/// </summary>
+/// <typeparam name="TArgs">POCO describing the tool's arguments.</typeparam>
+public abstract class Tool<TArgs> : ITool
+    where TArgs : class
+{
+    private static readonly JsonSerializerOptions s_jsonOptions = new(JsonSerializerDefaults.Web);
+
+    /// <summary>Unique tool name presented to the model.</summary>
+    public abstract string Name { get; }
+
+    /// <summary>Natural-language description presented to the model.</summary>
+    public abstract string Description { get; }
+
+    /// <inheritdoc />
+    public ToolDefinition Definition => new(Name, Description, BuildSchema());
+
+    /// <summary>
+    /// Executes the tool with deserialized arguments.
+    /// </summary>
+    /// <param name="args">Deserialized arguments.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>Result text fed back to the model.</returns>
+    protected abstract Task<string> InvokeAsync(TArgs args, CancellationToken cancellationToken);
+
+    /// <inheritdoc />
+    public Task<string> InvokeAsync(JsonElement arguments, CancellationToken cancellationToken = default)
+    {
+        var args = arguments.Deserialize<TArgs>(s_jsonOptions)
+            ?? throw new ArgumentException($"Tool '{Name}' received null or invalid arguments.", nameof(arguments));
+        return InvokeAsync(args, cancellationToken);
+    }
+
+    /// <summary>
+    /// Builds the JSON Schema for <typeparamref name="TArgs"/>. The default implementation derives
+    /// it from public properties; override to hand-craft the schema.
+    /// </summary>
+    protected virtual JsonElement BuildSchema()
+        => throw new NotImplementedException("Schema generation from TArgs is not implemented yet.");
+}

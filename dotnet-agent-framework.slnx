@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/" />
+  <Folder Name="/src/dotnet-agent-framework/">
+    <Project Path="src/dotnet-agent-framework/DotnetAgentFramework.csproj" />
+  </Folder>
+  <Folder Name="/tests/" />
+  <Folder Name="/tests/dotnet-agent-framework.Tests/">
+    <Project Path="tests/dotnet-agent-framework.Tests/DotnetAgentFramework.Tests.csproj" />
+  </Folder>
+</Solution>
