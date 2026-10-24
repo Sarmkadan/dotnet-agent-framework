@@ -36,6 +36,9 @@ public abstract class Tool<TArgs> : ITool
 {
     private static readonly JsonSerializerOptions s_jsonOptions = new(JsonSerializerDefaults.Web);
 
+    // Per closed generic type, so reflection runs once for each TArgs.
+    private static readonly Lazy<JsonElement> s_schema = new(() => JsonSchemaGenerator.Generate(typeof(TArgs)));
+
     /// <summary>Unique tool name presented to the model.</summary>
     public abstract string Name { get; }
 
@@ -63,8 +66,7 @@ public abstract class Tool<TArgs> : ITool
 
     /// <summary>
     /// Builds the JSON Schema for <typeparamref name="TArgs"/>. The default implementation derives
-    /// it from public properties; override to hand-craft the schema.
+    /// it from public properties (cached per type); override to hand-craft the schema.
     /// </summary>
-    protected virtual JsonElement BuildSchema()
-        => throw new NotImplementedException("Schema generation from TArgs is not implemented yet.");
+    protected virtual JsonElement BuildSchema() => s_schema.Value;
 }
