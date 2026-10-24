@@ -34,17 +34,69 @@ public interface IAgentMemory
 /// Simplest possible memory: an unbounded in-process list that returns the full history.
 /// Suitable for short interactive sessions and tests.
 /// </summary>
+/// <remarks>
+/// All members are thread-safe, so concurrent appends from parallel tool execution are supported.
+/// <see cref="RecallAsync"/> ignores its <c>query</c> argument and always returns the full history.
+/// </remarks>
 public sealed class InMemoryAgentMemory : IAgentMemory
 {
-    /// <inheritdoc />
-    public Task AppendAsync(ChatMessage message, CancellationToken cancellationToken = default)
-        => throw new NotImplementedException();
+    private readonly Lock _gate = new();
+    private readonly List<ChatMessage> _messages = [];
+
+    /// <summary>
+    /// Gets the number of messages currently stored.
+    /// </summary>
+    public int Count
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _messages.Count;
+            }
+        }
+    }
 
     /// <inheritdoc />
+    public Task AppendAsync(ChatMessage message, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (_gate)
+        {
+            _messages.Add(message);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Returns a snapshot of the full history. The <paramref name="query"/> is ignored by this implementation.
+    /// The returned list is a copy, so later appends or clears do not affect it.
+    /// </summary>
+    /// <param name="query">Ignored by this implementation.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A copy of all stored messages in chronological order.</returns>
     public Task<IReadOnlyList<ChatMessage>> RecallAsync(string query, CancellationToken cancellationToken = default)
-        => throw new NotImplementedException();
+    {
+        IReadOnlyList<ChatMessage> snapshot;
+
+        lock (_gate)
+        {
+            snapshot = _messages.ToArray();
+        }
+
+        return Task.FromResult(snapshot);
+    }
 
     /// <inheritdoc />
     public Task ClearAsync(CancellationToken cancellationToken = default)
-        => throw new NotImplementedException();
+    {
+        lock (_gate)
+        {
+            _messages.Clear();
+        }
+
+        return Task.CompletedTask;
+    }
 }
