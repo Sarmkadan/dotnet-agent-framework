@@ -38,6 +38,7 @@ public sealed class Agent
     private readonly IAgentMemory _memory;
     private readonly IReadOnlyDictionary<string, ITool> _tools;
     private readonly AgentOptions _options;
+    private readonly IReadOnlyList<ToolDefinition> _toolDefinitions;
 
     /// <summary>
     /// Creates an agent.
@@ -60,6 +61,7 @@ public sealed class Agent
         _memory = memory ?? new InMemoryAgentMemory();
         _options = options ?? new AgentOptions();
         _tools = tools.ToDictionary(t => t.Definition.Name, StringComparer.Ordinal);
+        _toolDefinitions = _tools.Values.Select(t => t.Definition).ToList();
     }
 
     /// <summary>
@@ -81,8 +83,42 @@ public sealed class Agent
     /// <exception cref="AgentStepLimitExceededException">
     /// The model kept requesting tools after <see cref="AgentOptions.MaxSteps"/> iterations.
     /// </exception>
-    public Task<AgentResult> RunAsync(string input, CancellationToken cancellationToken = default)
-        => throw new NotImplementedException();
+    public async Task<AgentResult> RunAsync(string input, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+
+        var transcript = new List<ChatMessage>();
+        var usage = default(TokenUsage);
+
+        var userMessage = ChatMessage.User(input);
+        await AppendAsync(userMessage, transcript, cancellationToken).ConfigureAwait(false);
+
+        for (var step = 1; step <= _options.MaxSteps; step++)
+        {
+            var history = await _memory.RecallAsync(input, cancellationToken).ConfigureAwait(false);
+            var messages = WithSystemPrompt(history);
+
+            var completion = await _model.CompleteAsync(messages, _toolDefinitions, cancellationToken)
+                .ConfigureAwait(false);
+            usage += completion.Usage ?? default;
+
+            var assistant = completion.Message;
+            await AppendAsync(assistant, transcript, cancellationToken).ConfigureAwait(false);
+
+            if (assistant.ToolCalls is null || assistant.ToolCalls.Count == 0)
+            {
+                return new AgentResult(assistant.Content, step, transcript, usage);
+            }
+
+            foreach (var call in assistant.ToolCalls)
+            {
+                var result = await ExecuteToolCallAsync(call, cancellationToken).ConfigureAwait(false);
+                await AppendAsync(result, transcript, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        throw new AgentStepLimitExceededException(_options.MaxSteps);
+    }
 
     /// <summary>
     /// Runs the agent and streams the final answer's text as it is generated. Intermediate tool
@@ -93,6 +129,31 @@ public sealed class Agent
     /// <returns>Text deltas of the final answer.</returns>
     public IAsyncEnumerable<string> StreamAsync(string input, CancellationToken cancellationToken = default)
         => throw new NotImplementedException();
+
+    private async Task AppendAsync(ChatMessage message, List<ChatMessage> transcript, CancellationToken cancellationToken)
+    {
+        await _memory.AppendAsync(message, cancellationToken).ConfigureAwait(false);
+        transcript.Add(message);
+    }
+
+    private IReadOnlyList<ChatMessage> WithSystemPrompt(IReadOnlyList<ChatMessage> history)
+    {
+        if (_options.SystemPrompt is null || (history.Count > 0 && history[0].Role == MessageRole.System))
+        {
+            return history;
+        }
+
+        var messages = new List<ChatMessage>(history.Count + 1) { ChatMessage.System(_options.SystemPrompt) };
+        messages.AddRange(history);
+        return messages;
+    }
+
+    private async Task<ChatMessage> ExecuteToolCallAsync(ToolCall call, CancellationToken cancellationToken)
+    {
+        var tool = _tools[call.Name];
+        var result = await tool.InvokeAsync(call.Arguments, cancellationToken).ConfigureAwait(false);
+        return ChatMessage.ToolResult(call.Id, result);
+    }
 }
 
 /// <summary>
