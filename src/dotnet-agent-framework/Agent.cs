@@ -1,3 +1,6 @@
+using System.Runtime.CompilerServices;
+using System.Text;
+
 namespace DotnetAgentFramework;
 
 /// <summary>
@@ -103,8 +106,7 @@ public sealed class Agent
 
         for (var step = 1; step <= _options.MaxSteps; step++)
         {
-            var history = await _memory.RecallAsync(input, cancellationToken).ConfigureAwait(false);
-            var messages = WithSystemPrompt(history);
+            var messages = await BuildPromptAsync(input, cancellationToken).ConfigureAwait(false);
 
             var completion = await _model.CompleteAsync(messages, _toolDefinitions, cancellationToken)
                 .ConfigureAwait(false);
@@ -132,16 +134,79 @@ public sealed class Agent
     /// Runs the agent and streams the final answer's text as it is generated. Intermediate tool
     /// steps are executed silently before the stream starts.
     /// </summary>
+    /// <remarks>
+    /// Deciding whether to call a tool requires the complete, non-streaming response, so every
+    /// step is first made with <see cref="IChatModel.CompleteAsync"/>. Once a step comes back
+    /// without tool calls, its content is discarded and the same prompt is sent again through
+    /// <see cref="IChatModel.StreamAsync"/> so callers receive the answer token by token. The
+    /// answer is appended to memory only after the stream completes; if the caller stops
+    /// enumerating early or the token is cancelled, nothing is recorded for that answer.
+    /// </remarks>
     /// <param name="input">User message that starts (or continues) the conversation.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>Text deltas of the final answer.</returns>
-    public IAsyncEnumerable<string> StreamAsync(string input, CancellationToken cancellationToken = default)
-        => throw new NotImplementedException();
+    /// <exception cref="ArgumentNullException"><paramref name="input"/> is <see langword="null"/>.</exception>
+    /// <exception cref="AgentStepLimitExceededException">
+    /// The model kept requesting tools after <see cref="AgentOptions.MaxSteps"/> iterations.
+    /// </exception>
+    public async IAsyncEnumerable<string> StreamAsync(
+        string input,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+
+        await _memory.AppendAsync(ChatMessage.User(input), cancellationToken).ConfigureAwait(false);
+
+        IReadOnlyList<ChatMessage>? finalPrompt = null;
+        for (var step = 1; step <= _options.MaxSteps; step++)
+        {
+            var messages = await BuildPromptAsync(input, cancellationToken).ConfigureAwait(false);
+
+            var completion = await _model.CompleteAsync(messages, _toolDefinitions, cancellationToken)
+                .ConfigureAwait(false);
+
+            var assistant = completion.Message;
+            if (assistant.ToolCalls is null || assistant.ToolCalls.Count == 0)
+            {
+                finalPrompt = messages;
+                break;
+            }
+
+            await _memory.AppendAsync(assistant, cancellationToken).ConfigureAwait(false);
+
+            var results = await ExecuteToolCallsAsync(assistant.ToolCalls, cancellationToken).ConfigureAwait(false);
+            foreach (var result in results)
+            {
+                await _memory.AppendAsync(result, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        if (finalPrompt is null)
+        {
+            throw new AgentStepLimitExceededException(_options.MaxSteps);
+        }
+
+        var builder = new StringBuilder();
+        await foreach (var delta in _model.StreamAsync(finalPrompt, _toolDefinitions, cancellationToken)
+            .ConfigureAwait(false))
+        {
+            builder.Append(delta);
+            yield return delta;
+        }
+
+        await _memory.AppendAsync(ChatMessage.Assistant(builder.ToString()), cancellationToken).ConfigureAwait(false);
+    }
 
     private async Task AppendAsync(ChatMessage message, List<ChatMessage> transcript, CancellationToken cancellationToken)
     {
         await _memory.AppendAsync(message, cancellationToken).ConfigureAwait(false);
         transcript.Add(message);
+    }
+
+    private async Task<IReadOnlyList<ChatMessage>> BuildPromptAsync(string input, CancellationToken cancellationToken)
+    {
+        var history = await _memory.RecallAsync(input, cancellationToken).ConfigureAwait(false);
+        return WithSystemPrompt(history);
     }
 
     private IReadOnlyList<ChatMessage> WithSystemPrompt(IReadOnlyList<ChatMessage> history)

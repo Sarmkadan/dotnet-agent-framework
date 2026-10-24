@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 
 namespace DotnetAgentFramework.Tests;
@@ -72,11 +73,80 @@ public class AgentTests
         Assert.Equal(["1", "2", "3"], result.Transcript.Where(m => m.Role == MessageRole.Tool).Select(m => m.ToolCallId));
     }
 
+    [Fact]
+    public async Task StreamAsync_FinalAnswer_YieldsDeltasAndRecordsConcatenatedAnswer()
+    {
+        var model = new FakeChatModel(Turn(ChatMessage.Assistant("ignored")))
+        {
+            StreamDeltas = ["Hel", "lo"],
+        };
+        var memory = new InMemoryAgentMemory();
+        var agent = new Agent(model, [], memory);
+
+        var deltas = await CollectAsync(agent.StreamAsync("go"));
+
+        Assert.Equal(["Hel", "lo"], deltas);
+        Assert.Equal(1, model.StreamCalls);
+        var history = await memory.RecallAsync("go");
+        Assert.Equal(["go", "Hello"], history.Select(m => m.Content));
+        Assert.Equal(MessageRole.Assistant, history[^1].Role);
+    }
+
+    [Fact]
+    public async Task StreamAsync_ToolCallThenAnswer_ExecutesToolsBeforeStreaming()
+    {
+        var model = new FakeChatModel(
+            Turn(new ToolCall("call-1", "lookup", default)),
+            Turn(ChatMessage.Assistant("draft")))
+        {
+            StreamDeltas = ["ok"],
+        };
+        var memory = new InMemoryAgentMemory();
+        var agent = new Agent(model, [new FakeTool("lookup", (_, _) => Task.FromResult("found"))], memory);
+
+        var deltas = await CollectAsync(agent.StreamAsync("go"));
+
+        Assert.Equal(["ok"], deltas);
+        Assert.Equal(1, model.StreamCalls);
+        var history = await memory.RecallAsync("go");
+        Assert.Equal(
+            [MessageRole.User, MessageRole.Assistant, MessageRole.Tool, MessageRole.Assistant],
+            history.Select(m => m.Role));
+        Assert.Equal("found", history[2].Content);
+        Assert.Equal("ok", history[^1].Content);
+    }
+
+    [Fact]
+    public async Task StreamAsync_StepLimitReachedWithToolCalls_ThrowsWithoutStreaming()
+    {
+        var model = new FakeChatModel(
+            Turn(new ToolCall("1", "t", default)),
+            Turn(new ToolCall("2", "t", default)))
+        {
+            StreamDeltas = ["never"],
+        };
+        var agent = new Agent(model, [new FakeTool("t", (_, _) => Task.FromResult("ok"))], options: new AgentOptions { MaxSteps = 2 });
+
+        await Assert.ThrowsAsync<AgentStepLimitExceededException>(() => CollectAsync(agent.StreamAsync("go")));
+        Assert.Equal(0, model.StreamCalls);
+    }
+
     private static ChatCompletion Turn(params ToolCall[] calls)
         => new(ChatMessage.Assistant(string.Empty, calls));
 
     private static ChatCompletion Turn(ChatMessage message)
         => new(message);
+
+    private static async Task<List<string>> CollectAsync(IAsyncEnumerable<string> stream)
+    {
+        var items = new List<string>();
+        await foreach (var item in stream)
+        {
+            items.Add(item);
+        }
+
+        return items;
+    }
 
     private static void InterlockedMax(ref int target, int candidate)
     {
@@ -98,17 +168,27 @@ public class AgentTests
 
         public string ModelId => "fake";
 
+        public IReadOnlyList<string> StreamDeltas { get; init; } = [];
+
+        public int StreamCalls { get; private set; }
+
         public Task<ChatCompletion> CompleteAsync(
             IReadOnlyList<ChatMessage> messages,
             IReadOnlyList<ToolDefinition> tools,
             CancellationToken cancellationToken = default)
             => Task.FromResult(_script.Dequeue());
 
-        public IAsyncEnumerable<string> StreamAsync(
+        public async IAsyncEnumerable<string> StreamAsync(
             IReadOnlyList<ChatMessage> messages,
             IReadOnlyList<ToolDefinition> tools,
-            CancellationToken cancellationToken = default)
-            => throw new NotSupportedException();
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            StreamCalls++;
+            foreach (var delta in StreamDeltas)
+            {
+                yield return delta;
+            }
+        }
     }
 
     private sealed class FakeTool(string name, Func<JsonElement, CancellationToken, Task<string>> invoke) : ITool
