@@ -139,19 +139,16 @@ public sealed class SlidingWindowAgentMemory : IAgentMemory
         // A pinned system message takes one slot, so the suffix gets the rest of the budget.
         bool pinSystem = history[0].Role == MessageRole.System;
         int budget = pinSystem ? MaxMessages - 1 : MaxMessages;
-        int start = AlignToToolBoundary(history, history.Count - budget);
+        IReadOnlyList<ChatMessage> suffix = ConversationWindow.TakeSuffixPreservingToolPairs(history, history.Count - budget);
 
-        var window = new List<ChatMessage>(history.Count - start + 1);
+        var window = new List<ChatMessage>(suffix.Count + 1);
 
         if (pinSystem)
         {
             window.Add(history[0]);
         }
 
-        for (int i = start; i < history.Count; i++)
-        {
-            window.Add(history[i]);
-        }
+        window.AddRange(suffix);
 
         Debug.Assert(
             window.Count == 0 || window[0].Role != MessageRole.Tool,
@@ -162,47 +159,5 @@ public sealed class SlidingWindowAgentMemory : IAgentMemory
             "A sliding window must not end with an assistant message whose tool results are missing.");
 
         return window;
-    }
-
-    /// <summary>
-    /// Moves <paramref name="start"/> so that it does not point at a tool result whose request is outside the window.
-    /// </summary>
-    private static int AlignToToolBoundary(List<ChatMessage> history, int start)
-    {
-        while (start < history.Count && history[start].Role == MessageRole.Tool)
-        {
-            int owner = FindToolCallOwner(history, start, history[start].ToolCallId);
-            if (owner >= 0)
-            {
-                return owner;
-            }
-
-            // The result has no matching request in the history. Including it would be invalid, so drop it.
-            start++;
-        }
-
-        return start;
-    }
-
-    private static int FindToolCallOwner(List<ChatMessage> history, int before, string? toolCallId)
-    {
-        if (toolCallId is null)
-        {
-            return -1;
-        }
-
-        for (int i = before - 1; i >= 0; i--)
-        {
-            ChatMessage candidate = history[i];
-
-            if (candidate.Role == MessageRole.Assistant
-                && candidate.ToolCalls is { } calls
-                && calls.Any(call => call.Id == toolCallId))
-            {
-                return i;
-            }
-        }
-
-        return -1;
     }
 }
