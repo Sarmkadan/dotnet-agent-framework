@@ -17,7 +17,13 @@ public sealed class AgentOptions
     public int MaxSteps { get; set; } = 10;
 
     /// <summary>
-    /// When <see langword="true"/>, independent tool calls from a single completion run concurrently.
+    /// When <see langword="true"/>, the tool calls requested in a single completion run concurrently.
+    /// Results are still appended to memory and the transcript in the same order as the calls the
+    /// model requested, and only after every call in the batch has finished, so each tool result
+    /// follows its assistant message in order and memory never holds a partial step. When
+    /// <see langword="false"/>, calls run one after another in request order. A single call always
+    /// runs inline regardless of this setting. Tool failures and timeouts are returned as results;
+    /// only caller cancellation propagates.
     /// </summary>
     public bool ParallelToolCalls { get; set; } = true;
 
@@ -112,9 +118,9 @@ public sealed class Agent
                 return new AgentResult(assistant.Content, step, transcript, usage);
             }
 
-            foreach (var call in assistant.ToolCalls)
+            var results = await ExecuteToolCallsAsync(assistant.ToolCalls, cancellationToken).ConfigureAwait(false);
+            foreach (var result in results)
             {
-                var result = await ExecuteToolCallAsync(call, cancellationToken).ConfigureAwait(false);
                 await AppendAsync(result, transcript, cancellationToken).ConfigureAwait(false);
             }
         }
@@ -148,6 +154,26 @@ public sealed class Agent
         var messages = new List<ChatMessage>(history.Count + 1) { ChatMessage.System(_options.SystemPrompt) };
         messages.AddRange(history);
         return messages;
+    }
+
+    private async Task<IReadOnlyList<ChatMessage>> ExecuteToolCallsAsync(
+        IReadOnlyList<ToolCall> calls,
+        CancellationToken cancellationToken)
+    {
+        if (!_options.ParallelToolCalls || calls.Count <= 1)
+        {
+            var sequential = new List<ChatMessage>(calls.Count);
+            foreach (var call in calls)
+            {
+                sequential.Add(await ExecuteToolCallAsync(call, cancellationToken).ConfigureAwait(false));
+            }
+
+            return sequential;
+        }
+
+        // Task.WhenAll preserves input order in its result, so each tool message lines up with its call.
+        var tasks = calls.Select(call => ExecuteToolCallAsync(call, cancellationToken)).ToArray();
+        return await Task.WhenAll(tasks).ConfigureAwait(false);
     }
 
     private async Task<ChatMessage> ExecuteToolCallAsync(ToolCall call, CancellationToken cancellationToken)
