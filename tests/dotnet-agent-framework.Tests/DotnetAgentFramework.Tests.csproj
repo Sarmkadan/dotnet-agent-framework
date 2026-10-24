@@ -6,6 +6,8 @@
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
     <RootNamespace>DotnetAgentFramework.Tests</RootNamespace>
+    <!-- Allow running on a newer major runtime when .NET 9 is not installed (e.g. local machines with only 8/10). -->
+    <RollForward>Major</RollForward>
   </PropertyGroup>
 
   <ItemGroup>
