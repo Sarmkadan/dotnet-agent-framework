@@ -152,7 +152,7 @@ public sealed class Agent
                 .ConfigureAwait(false);
             usage += completion.Usage ?? default;
 
-            var assistant = completion.Message;
+            var assistant = ValidateModelMessage(completion.Message);
             await AppendAsync(assistant, transcript, cancellationToken).ConfigureAwait(false);
 
             if (assistant.ToolCalls is null || assistant.ToolCalls.Count == 0)
@@ -212,7 +212,7 @@ public sealed class Agent
             var completion = await _model.CompleteAsync(messages, _toolDefinitions, cancellationToken)
                 .ConfigureAwait(false);
 
-            var assistant = completion.Message;
+            var assistant = ValidateModelMessage(completion.Message);
             if (assistant.ToolCalls is null || assistant.ToolCalls.Count == 0)
             {
                 finalPrompt = messages;
@@ -258,6 +258,22 @@ public sealed class Agent
                 timeout,
                 "ToolTimeout must be positive when set. Use null to disable the timeout.");
         }
+    }
+
+    private ChatMessage ValidateModelMessage(ChatMessage message)
+    {
+        try
+        {
+            ChatMessage.Validate(message);
+        }
+        catch (ArgumentException ex)
+        {
+            throw new InvalidOperationException(
+                $"Model '{_model.ModelId}' returned an invalid message: {ex.Message}",
+                ex);
+        }
+
+        return message;
     }
 
     private async Task AppendAsync(ChatMessage message, List<ChatMessage> transcript, CancellationToken cancellationToken)

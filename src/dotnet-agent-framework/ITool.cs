@@ -62,11 +62,30 @@ public abstract class Tool<TArgs> : ITool
     protected abstract Task<string> InvokeAsync(TArgs args, CancellationToken cancellationToken);
 
     /// <inheritdoc />
+    /// <remarks>
+    /// Arguments the model got wrong (not an object, or not deserializable into <typeparamref name="TArgs"/>)
+    /// are returned as an error result text so the model can retry; they do not throw.
+    /// </remarks>
     public Task<string> InvokeAsync(JsonElement arguments, CancellationToken cancellationToken = default)
     {
-        var args = arguments.Deserialize<TArgs>(s_jsonOptions)
-            ?? throw new ArgumentException($"Tool '{Name}' received null or invalid arguments.", nameof(arguments));
-        return InvokeAsync(args, cancellationToken);
+        if (arguments.ValueKind != JsonValueKind.Object)
+        {
+            return Task.FromResult($"Error: tool '{Name}' expected a JSON object but received {arguments.ValueKind}.");
+        }
+
+        TArgs? args;
+        try
+        {
+            args = arguments.Deserialize<TArgs>(s_jsonOptions);
+        }
+        catch (JsonException ex)
+        {
+            return Task.FromResult($"Error: tool '{Name}' received arguments that could not be deserialized: {ex.Message}");
+        }
+
+        return InvokeAsync(
+            args ?? throw new ArgumentException($"Tool '{Name}' received null arguments.", nameof(arguments)),
+            cancellationToken);
     }
 
     /// <summary>

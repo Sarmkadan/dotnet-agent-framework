@@ -1,3 +1,4 @@
+using System.Text.Json;
 using DotnetAgentFramework.Tests.Fakes;
 
 namespace DotnetAgentFramework.Tests;
@@ -106,6 +107,42 @@ public class AgentGuardTests
         Assert.Equal("input", ex.ParamName);
         Assert.Equal(0, model.StreamCalls);
         Assert.Empty(model.ReceivedPrompts);
+    }
+
+    [Fact]
+    public async Task RunAsync_ModelReturnsInvalidMessage_ThrowsInvalidOperationExceptionNamingModel()
+    {
+        var model = new FakeChatModel();
+        // A user-role message carrying tool calls is malformed: only assistant messages may.
+        model.Responses.Enqueue(new ChatCompletion(
+            new ChatMessage(MessageRole.User, "", [ToolCall.Create("c1", "echo", JsonSerializer.SerializeToElement(new { text = "x" }))])));
+        var agent = new Agent(model, [new EchoTool()]);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => agent.RunAsync("hi"));
+
+        Assert.Equal(
+            "Model 'fake' returned an invalid message: Only Assistant messages may carry ToolCalls, but a User message did. (Parameter 'message')",
+            ex.Message);
+        Assert.IsType<ArgumentException>(ex.InnerException);
+        Assert.Single(model.ReceivedPrompts);
+    }
+
+    [Fact]
+    public async Task StreamAsync_ModelReturnsInvalidMessage_ThrowsInvalidOperationExceptionOnEnumeration()
+    {
+        var model = new FakeChatModel();
+        model.Responses.Enqueue(new ChatCompletion(new ChatMessage(MessageRole.Tool, "orphan")));
+        var agent = new Agent(model, []);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            await foreach (var _ in agent.StreamAsync("hi"))
+            {
+            }
+        });
+
+        Assert.StartsWith("Model 'fake' returned an invalid message: Tool messages must have a non-whitespace ToolCallId.", ex.Message);
+        Assert.IsType<ArgumentException>(ex.InnerException);
     }
 
     [Fact]

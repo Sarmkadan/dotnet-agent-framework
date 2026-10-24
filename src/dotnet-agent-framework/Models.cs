@@ -34,18 +34,80 @@ public sealed record ChatMessage(
     string? ToolCallId = null)
 {
     /// <summary>Creates a system message.</summary>
-    public static ChatMessage System(string content) => new(MessageRole.System, content);
+    /// <exception cref="ArgumentNullException"><paramref name="content"/> is <see langword="null"/>.</exception>
+    public static ChatMessage System(string content)
+    {
+        ArgumentNullException.ThrowIfNull(content);
+
+        return new(MessageRole.System, content);
+    }
 
     /// <summary>Creates a user message.</summary>
-    public static ChatMessage User(string content) => new(MessageRole.User, content);
+    /// <exception cref="ArgumentNullException"><paramref name="content"/> is <see langword="null"/>.</exception>
+    public static ChatMessage User(string content)
+    {
+        ArgumentNullException.ThrowIfNull(content);
+
+        return new(MessageRole.User, content);
+    }
 
     /// <summary>Creates an assistant message.</summary>
+    /// <exception cref="ArgumentNullException"><paramref name="content"/> is <see langword="null"/>.</exception>
     public static ChatMessage Assistant(string content, IReadOnlyList<ToolCall>? toolCalls = null)
-        => new(MessageRole.Assistant, content, toolCalls);
+    {
+        ArgumentNullException.ThrowIfNull(content);
+
+        return new(MessageRole.Assistant, content, toolCalls);
+    }
 
     /// <summary>Creates a tool result message answering the given call.</summary>
+    /// <exception cref="ArgumentNullException"><paramref name="toolCallId"/> or <paramref name="content"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException"><paramref name="toolCallId"/> is empty or whitespace.</exception>
     public static ChatMessage ToolResult(string toolCallId, string content)
-        => new(MessageRole.Tool, content, ToolCallId: toolCallId);
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(toolCallId);
+        ArgumentNullException.ThrowIfNull(content);
+
+        return new(MessageRole.Tool, content, ToolCallId: toolCallId);
+    }
+
+    /// <summary>
+    /// Checks that a message is internally consistent. Use it on messages that come from outside the
+    /// framework, such as model output, before they enter memory.
+    /// </summary>
+    /// <remarks>
+    /// Rules: a <see cref="MessageRole.Tool"/> message must have a non-whitespace <see cref="ToolCallId"/>;
+    /// no other role may set <see cref="ToolCallId"/>; only <see cref="MessageRole.Assistant"/> messages
+    /// may carry <see cref="ToolCalls"/>.
+    /// </remarks>
+    /// <param name="message">Message to check.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="message"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException"><paramref name="message"/> breaks one of the rules above.</exception>
+    public static void Validate(ChatMessage message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+
+        if (message.Role == MessageRole.Tool)
+        {
+            if (string.IsNullOrWhiteSpace(message.ToolCallId))
+            {
+                throw new ArgumentException("Tool messages must have a non-whitespace ToolCallId.", nameof(message));
+            }
+        }
+        else if (message.ToolCallId is not null)
+        {
+            throw new ArgumentException(
+                $"Only Tool messages may set ToolCallId, but a {message.Role} message did.",
+                nameof(message));
+        }
+
+        if (message.Role != MessageRole.Assistant && message.ToolCalls is { Count: > 0 })
+        {
+            throw new ArgumentException(
+                $"Only Assistant messages may carry ToolCalls, but a {message.Role} message did.",
+                nameof(message));
+        }
+    }
 }
 
 /// <summary>
@@ -54,7 +116,35 @@ public sealed record ChatMessage(
 /// <param name="Id">Provider-assigned identifier used to correlate the result.</param>
 /// <param name="Name">Name of the tool to invoke.</param>
 /// <param name="Arguments">Arguments as a JSON object.</param>
-public sealed record ToolCall(string Id, string Name, JsonElement Arguments);
+public sealed record ToolCall(string Id, string Name, JsonElement Arguments)
+{
+    /// <summary>
+    /// Creates a validated tool call. Use this for calls built in code; the record constructor remains
+    /// available for deserialization.
+    /// </summary>
+    /// <param name="id">Provider-assigned identifier. Must not be empty or whitespace.</param>
+    /// <param name="name">Name of the tool to invoke. Must not be empty or whitespace.</param>
+    /// <param name="arguments">Arguments as a JSON object.</param>
+    /// <returns>The tool call.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="id"/> or <paramref name="name"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="id"/> or <paramref name="name"/> is empty or whitespace, or <paramref name="arguments"/>
+    /// is not a JSON object.
+    /// </exception>
+    public static ToolCall Create(string id, string name, JsonElement arguments)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(id);
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        if (arguments.ValueKind != JsonValueKind.Object)
+        {
+            throw new ArgumentException(
+                $"Tool call arguments must be a JSON object, but were {arguments.ValueKind}.",
+                nameof(arguments));
+        }
+
+        return new(id, name, arguments);
+    }
+}
 
 /// <summary>
 /// Describes a tool's name, purpose and argument schema so the model can decide when to call it.
@@ -62,7 +152,32 @@ public sealed record ToolCall(string Id, string Name, JsonElement Arguments);
 /// <param name="Name">Unique tool name (snake_case recommended).</param>
 /// <param name="Description">Natural-language description shown to the model.</param>
 /// <param name="ParametersSchema">JSON Schema for the arguments object.</param>
-public sealed record ToolDefinition(string Name, string Description, JsonElement ParametersSchema);
+public sealed record ToolDefinition(string Name, string Description, JsonElement ParametersSchema)
+{
+    /// <summary>
+    /// Creates a validated tool definition. Use this for definitions built in code; the record constructor
+    /// remains available for deserialization.
+    /// </summary>
+    /// <param name="name">Unique tool name. Must not be empty or whitespace.</param>
+    /// <param name="description">Natural-language description shown to the model.</param>
+    /// <param name="schema">JSON Schema for the arguments. Must be a JSON object.</param>
+    /// <returns>The tool definition.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="name"/> or <paramref name="description"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException"><paramref name="name"/> is empty or whitespace, or <paramref name="schema"/> is not a JSON object.</exception>
+    public static ToolDefinition Create(string name, string description, JsonElement schema)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ArgumentNullException.ThrowIfNull(description);
+        if (schema.ValueKind != JsonValueKind.Object)
+        {
+            throw new ArgumentException(
+                $"Tool parameters schema must be a JSON object, but was {schema.ValueKind}.",
+                nameof(schema));
+        }
+
+        return new(name, description, schema);
+    }
+}
 
 /// <summary>
 /// Token usage reported by the model provider for a single completion.
