@@ -34,6 +34,7 @@ src/dotnet-agent-framework/        library, namespace DotnetAgentFramework
     OpenAIChatModelOptions.cs       configuration for OpenAIChatModel, validated on construction
     OpenAIWireFormat.cs             internal framework <-> OpenAI wire-format conversions
     SseParser.cs                    internal Server-Sent Events reader (data field only)
+  DependencyInjection/              AddAgentFramework, AddTool, AddOpenAIChatModel, AddAgentMemory (namespace DotnetAgentFramework)
   Testing/ScriptedChatModel.cs      ScriptedChatModel: deterministic IChatModel for consumers' tests. Namespace
                                     DotnetAgentFramework.Testing, the ONE allowed sub-namespace (everything else is DotnetAgentFramework)
 tests/dotnet-agent-framework.Tests/ xunit, references the library
@@ -60,7 +61,7 @@ Current state: public API shape is defined and documented; method bodies throw `
 - Every public member has XML docs (`GenerateDocumentationFile` is on, missing docs fail the build).
 - Async methods end in `Async` and take `CancellationToken cancellationToken = default` as the last parameter.
 - Tools return recoverable errors as text (the model should see them), throw only for programmer errors.
-- No provider SDK dependencies in the core project. `System.Text.Json` only.
+- No provider SDK dependencies in the core project. `System.Text.Json` and `Microsoft.Extensions.*` abstractions only.
 - Tests: xunit, one class per type under test, method names `Method_Scenario_Expected`. Use hand-written fakes for `IChatModel`, not mocking libraries.
 - Conventional commits (`feat:`, `fix:`, `test:`, `docs:`, `chore:`). No `Co-Authored-By` trailers.
 - Analyzer level `latest-recommended` with warnings as errors; suppress with a justified `#pragma` or `.editorconfig` entry, not `<NoWarn>`.
