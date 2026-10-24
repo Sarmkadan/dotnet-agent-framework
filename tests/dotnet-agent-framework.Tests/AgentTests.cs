@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
-using System.Runtime.CompilerServices;
 using System.Text.Json;
+using DotnetAgentFramework.Testing;
 
 namespace DotnetAgentFramework.Tests;
 
@@ -34,7 +34,7 @@ public class AgentTests
             bothStarted.TrySetResult();
         });
 
-        var model = new FakeChatModel(
+        var model = Script(
             Turn(new ToolCall("call-a", "slow", default), new ToolCall("call-b", "fast", default)),
             Turn(ChatMessage.Assistant("done")));
         var agent = new Agent(model, [new FakeTool("slow", Slow), new FakeTool("fast", Fast)]);
@@ -61,7 +61,7 @@ public class AgentTests
             return "ok";
         }
 
-        var model = new FakeChatModel(
+        var model = Script(
             Turn(new ToolCall("1", "t", default), new ToolCall("2", "t", default), new ToolCall("3", "t", default)),
             Turn(ChatMessage.Assistant("done")));
         var options = new AgentOptions { ParallelToolCalls = false };
@@ -76,10 +76,7 @@ public class AgentTests
     [Fact]
     public async Task StreamAsync_FinalAnswer_YieldsDeltasAndRecordsConcatenatedAnswer()
     {
-        var model = new FakeChatModel(Turn(ChatMessage.Assistant("ignored")))
-        {
-            StreamDeltas = ["Hel", "lo"],
-        };
+        var model = new ScriptedChatModel().AnswerStreamed("Hel", "lo");
         var memory = new InMemoryAgentMemory();
         var agent = new Agent(model, [], memory);
 
@@ -95,12 +92,8 @@ public class AgentTests
     [Fact]
     public async Task StreamAsync_ToolCallThenAnswer_ExecutesToolsBeforeStreaming()
     {
-        var model = new FakeChatModel(
-            Turn(new ToolCall("call-1", "lookup", default)),
-            Turn(ChatMessage.Assistant("draft")))
-        {
-            StreamDeltas = ["ok"],
-        };
+        var model = Script(Turn(new ToolCall("call-1", "lookup", default)))
+            .AnswerStreamed("ok");
         var memory = new InMemoryAgentMemory();
         var agent = new Agent(model, [new FakeTool("lookup", (_, _) => Task.FromResult("found"))], memory);
 
@@ -119,12 +112,9 @@ public class AgentTests
     [Fact]
     public async Task StreamAsync_StepLimitReachedWithToolCalls_ThrowsWithoutStreaming()
     {
-        var model = new FakeChatModel(
+        var model = Script(
             Turn(new ToolCall("1", "t", default)),
-            Turn(new ToolCall("2", "t", default)))
-        {
-            StreamDeltas = ["never"],
-        };
+            Turn(new ToolCall("2", "t", default)));
         var agent = new Agent(model, [new FakeTool("t", (_, _) => Task.FromResult("ok"))], options: new AgentOptions { MaxSteps = 2 });
 
         await Assert.ThrowsAsync<AgentStepLimitExceededException>(() => CollectAsync(agent.StreamAsync("go")));
@@ -136,6 +126,17 @@ public class AgentTests
 
     private static ChatCompletion Turn(ChatMessage message)
         => new(message);
+
+    private static ScriptedChatModel Script(params ChatCompletion[] turns)
+    {
+        var model = new ScriptedChatModel();
+        foreach (var turn in turns)
+        {
+            model.Enqueue(turn);
+        }
+
+        return model;
+    }
 
     private static async Task<List<string>> CollectAsync(IAsyncEnumerable<string> stream)
     {
@@ -160,35 +161,6 @@ public class AgentTests
             }
         }
         while (Interlocked.CompareExchange(ref target, candidate, seen) != seen);
-    }
-
-    private sealed class FakeChatModel(params ChatCompletion[] script) : IChatModel
-    {
-        private readonly Queue<ChatCompletion> _script = new(script);
-
-        public string ModelId => "fake";
-
-        public IReadOnlyList<string> StreamDeltas { get; init; } = [];
-
-        public int StreamCalls { get; private set; }
-
-        public Task<ChatCompletion> CompleteAsync(
-            IReadOnlyList<ChatMessage> messages,
-            IReadOnlyList<ToolDefinition> tools,
-            CancellationToken cancellationToken = default)
-            => Task.FromResult(_script.Dequeue());
-
-        public async IAsyncEnumerable<string> StreamAsync(
-            IReadOnlyList<ChatMessage> messages,
-            IReadOnlyList<ToolDefinition> tools,
-            [EnumeratorCancellation] CancellationToken cancellationToken = default)
-        {
-            StreamCalls++;
-            foreach (var delta in StreamDeltas)
-            {
-                yield return delta;
-            }
-        }
     }
 
     private sealed class FakeTool(string name, Func<JsonElement, CancellationToken, Task<string>> invoke) : ITool

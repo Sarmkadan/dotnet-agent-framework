@@ -23,6 +23,8 @@ src/dotnet-agent-framework/        library, namespace DotnetAgentFramework
   ITool.cs                          ITool, Tool<TArgs> typed base
   IAgentMemory.cs                   IAgentMemory, InMemoryAgentMemory
   Models.cs                         ChatMessage, ToolCall, ToolDefinition, ChatCompletion, AgentResult, TokenUsage
+  Testing/ScriptedChatModel.cs      ScriptedChatModel: deterministic IChatModel for consumers' tests. Namespace
+                                    DotnetAgentFramework.Testing, the ONE allowed sub-namespace (everything else is DotnetAgentFramework)
 tests/dotnet-agent-framework.Tests/ xunit, references the library
 .github/workflows/ci.yml            build + test + pack on push/PR to main
 Directory.Build.props               shared MSBuild: Nullable, LangVersion latest, TreatWarningsAsErrors, analyzers

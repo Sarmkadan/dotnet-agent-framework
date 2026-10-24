@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text.Json;
+using DotnetAgentFramework.Testing;
 using DotnetAgentFramework.Tests.Fakes;
 
 namespace DotnetAgentFramework.Tests;
@@ -11,9 +12,9 @@ public class AgentToolExecutionTests
     [Fact]
     public async Task RunAsync_UnknownToolName_ModelReceivesErrorTextListingAvailableTools()
     {
-        var model = new FakeChatModel();
-        model.Responses.Enqueue(Requests(Call("c1", "missing")));
-        model.Responses.Enqueue(Answer("done"));
+        var model = new ScriptedChatModel();
+        model.Enqueue(Requests(Call("c1", "missing")));
+        model.Enqueue(Answer("done"));
         var agent = new Agent(model, [new EchoTool()]);
 
         var result = await agent.RunAsync("go");
@@ -28,9 +29,9 @@ public class AgentToolExecutionTests
     [Fact]
     public async Task RunAsync_ToolThrows_ModelReceivesErrorTextAndRunContinues()
     {
-        var model = new FakeChatModel();
-        model.Responses.Enqueue(Requests(Call("c1", "throwing")));
-        model.Responses.Enqueue(Answer("recovered"));
+        var model = new ScriptedChatModel();
+        model.Enqueue(Requests(Call("c1", "throwing")));
+        model.Enqueue(Answer("recovered"));
         var agent = new Agent(model, [new ThrowingTool()]);
 
         var result = await agent.RunAsync("go");
@@ -45,9 +46,9 @@ public class AgentToolExecutionTests
     [Fact]
     public async Task RunAsync_ToolExceedsToolTimeout_ModelReceivesTimeoutText()
     {
-        var model = new FakeChatModel();
-        model.Responses.Enqueue(Requests(Call("c1", "slow")));
-        model.Responses.Enqueue(Answer("gave up on the tool"));
+        var model = new ScriptedChatModel();
+        model.Enqueue(Requests(Call("c1", "slow")));
+        model.Enqueue(Answer("gave up on the tool"));
         var slow = new SlowTool(TimeSpan.FromSeconds(5));
         var options = new AgentOptions { ToolTimeout = TimeSpan.FromMilliseconds(50) };
         var agent = new Agent(model, [slow], options: options);
@@ -65,9 +66,9 @@ public class AgentToolExecutionTests
     [Fact]
     public async Task RunAsync_ToolTimeoutNull_SlowToolCompletes()
     {
-        var model = new FakeChatModel();
-        model.Responses.Enqueue(Requests(Call("c1", "slow")));
-        model.Responses.Enqueue(Answer("done"));
+        var model = new ScriptedChatModel();
+        model.Enqueue(Requests(Call("c1", "slow")));
+        model.Enqueue(Answer("done"));
         var options = new AgentOptions { ToolTimeout = null };
         var agent = new Agent(model, [new SlowTool(TimeSpan.FromMilliseconds(100))], options: options);
 
@@ -79,8 +80,8 @@ public class AgentToolExecutionTests
     [Fact]
     public async Task RunAsync_CallerCancelsDuringTool_ThrowsOperationCanceledException()
     {
-        var model = new FakeChatModel();
-        model.Responses.Enqueue(Requests(Call("c1", "slow")));
+        var model = new ScriptedChatModel();
+        model.Enqueue(Requests(Call("c1", "slow")));
         var slow = new SlowTool(TimeSpan.FromSeconds(5));
         var agent = new Agent(model, [slow]);
         using var cts = new CancellationTokenSource();
@@ -94,9 +95,9 @@ public class AgentToolExecutionTests
     [Fact]
     public async Task RunAsync_ParallelToolCallsTrue_ToolsRunConcurrently()
     {
-        var model = new FakeChatModel();
-        model.Responses.Enqueue(Requests(Call("c1", "first"), Call("c2", "second")));
-        model.Responses.Enqueue(Answer("done"));
+        var model = new ScriptedChatModel();
+        model.Enqueue(Requests(Call("c1", "first"), Call("c2", "second")));
+        model.Enqueue(Answer("done"));
         var first = new RecordingTool("first");
         var second = new RecordingTool("second");
         var options = new AgentOptions { ParallelToolCalls = true };
@@ -120,7 +121,7 @@ public class AgentToolExecutionTests
                 < Math.Min(firstInvocation.EndedAt, secondInvocation.EndedAt),
             "Both invocations should have been running at the same time.");
 
-        var toolMessages = model.ReceivedPrompts[1].Where(m => m.Role == MessageRole.Tool).ToList();
+        var toolMessages = model.Prompts[1].Where(m => m.Role == MessageRole.Tool).ToList();
         Assert.Equal(["c1", "c2"], toolMessages.Select(m => m.ToolCallId));
         Assert.Equal(["first-done", "second-done"], toolMessages.Select(m => m.Content));
     }
@@ -128,9 +129,9 @@ public class AgentToolExecutionTests
     [Fact]
     public async Task RunAsync_ParallelToolCallsFalse_ToolsRunSequentially()
     {
-        var model = new FakeChatModel();
-        model.Responses.Enqueue(Requests(Call("c1", "first"), Call("c2", "second")));
-        model.Responses.Enqueue(Answer("done"));
+        var model = new ScriptedChatModel();
+        model.Enqueue(Requests(Call("c1", "first"), Call("c2", "second")));
+        model.Enqueue(Answer("done"));
         var first = new RecordingTool("first");
         var second = new RecordingTool("second");
         first.Gate.SetResult("first-done");
@@ -148,15 +149,15 @@ public class AgentToolExecutionTests
     [Fact]
     public async Task RunAsync_TwoToolCallsSameStep_BothResultsAppendedBeforeNextCompletion()
     {
-        var model = new FakeChatModel();
-        model.Responses.Enqueue(Requests(Call("c1", "echo", "a"), Call("c2", "echo", "b")));
-        model.Responses.Enqueue(Answer("done"));
+        var model = new ScriptedChatModel();
+        model.Enqueue(Requests(Call("c1", "echo", "a"), Call("c2", "echo", "b")));
+        model.Enqueue(Answer("done"));
         var agent = new Agent(model, [new EchoTool()]);
 
         await agent.RunAsync("go");
 
         // The second completion must see the assistant message followed by both results, in call order.
-        var secondPrompt = model.ReceivedPrompts[1];
+        var secondPrompt = model.Prompts[1];
         Assert.Equal(
             [MessageRole.User, MessageRole.Assistant, MessageRole.Tool, MessageRole.Tool],
             secondPrompt.Select(m => m.Role));
@@ -176,6 +177,6 @@ public class AgentToolExecutionTests
     private static ToolCall Call(string id, string name, string text = "x")
         => new(id, name, JsonSerializer.SerializeToElement(new { text }));
 
-    private static ChatMessage ToolMessageFrom(FakeChatModel model, int promptIndex)
-        => Assert.Single(model.ReceivedPrompts[promptIndex], m => m.Role == MessageRole.Tool);
+    private static ChatMessage ToolMessageFrom(ScriptedChatModel model, int promptIndex)
+        => Assert.Single(model.Prompts[promptIndex], m => m.Role == MessageRole.Tool);
 }
