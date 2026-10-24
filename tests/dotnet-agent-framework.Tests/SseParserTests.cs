@@ -43,6 +43,29 @@ public class SseParserTests
     }
 
     [Fact]
+    public async Task ReadDataLinesAsync_HandlesCrLfAndMultiLineEvents()
+    {
+        var events = await ReadAllAsync(
+            "event: message\r\ndata: first line\r\ndata: second line\r\n\r\n: ping\r\n\r\ndata: last\r\n");
+
+        Assert.Equal(["first line\nsecond line", "last"], events);
+    }
+
+    [Fact]
+    public async Task ReadDataLinesAsync_LeadingUtf8Bom_FirstEventKept()
+    {
+        var bytes = new byte[] { 0xEF, 0xBB, 0xBF }.Concat(Encoding.UTF8.GetBytes("data: first\n\ndata: second\n\n")).ToArray();
+        using var stream = new MemoryStream(bytes);
+        var events = new List<string>();
+        await foreach (var data in SseParser.ReadDataLinesAsync(stream, CancellationToken.None))
+        {
+            events.Add(data);
+        }
+
+        Assert.Equal(["first", "second"], events);
+    }
+
+    [Fact]
     public async Task ReadDataLinesAsync_CommentsAndOtherFields_Ignored()
     {
         var events = await ReadAllAsync(": keep-alive\nevent: message\nid: 7\nretry: 1000\ndata: payload\n\n");

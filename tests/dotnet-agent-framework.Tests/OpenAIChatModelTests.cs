@@ -30,7 +30,7 @@ public class OpenAIChatModelTests
         }
         """;
 
-    private static HttpClient CreateClient(StubHttpMessageHandler handler, string baseAddress = "https://example.test/v1/")
+    private static HttpClient CreateClient(HttpMessageHandler handler, string baseAddress = "https://example.test/v1/")
         => new(handler) { BaseAddress = new Uri(baseAddress) };
 
     [Fact]
@@ -484,6 +484,112 @@ public class OpenAIChatModelTests
 
         Assert.Contains("did not respond within 0.1 s", ex.Message);
         Assert.IsAssignableFrom<OperationCanceledException>(ex.InnerException);
+    }
+
+    [Theory]
+    [InlineData("not json at all")]
+    [InlineData("[1,2,3]")]
+    [InlineData("")]
+    [InlineData(null)]
+    public async Task CompleteAsync_MalformedToolArguments_FallsBackToEmptyObject(string? arguments)
+    {
+        var body = $$$"""
+            {"choices":[{"message":{"role":"assistant","tool_calls":[
+              {"id":"c1","type":"function","function":{"name":"get_weather","arguments":{{{JsonSerializer.Serialize(arguments)}}}}}
+            ]}}]}
+            """;
+        var model = new OpenAIChatModel(CreateClient(new FakeHttpMessageHandler(body)), "gpt-4o");
+
+        var completion = await model.CompleteAsync([ChatMessage.User("weather?")], []);
+
+        var call = Assert.Single(completion.Message.ToolCalls!);
+        Assert.Equal("get_weather", call.Name);
+        Assert.Equal(JsonValueKind.Object, call.Arguments.ValueKind);
+        Assert.Empty(call.Arguments.EnumerateObject());
+    }
+
+    [Fact]
+    public async Task CompleteAsync_ToolDefinitions_SerializedAsFunctions()
+    {
+        var handler = new FakeHttpMessageHandler(_textResponse);
+        var model = new OpenAIChatModel(CreateClient(handler), "gpt-4o");
+        var schema = JsonDocument.Parse(
+            """{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}""").RootElement.Clone();
+
+        await model.CompleteAsync([ChatMessage.User("hi")], [ToolDefinition.Create("get_weather", "Weather lookup", schema)]);
+
+        using var body = JsonDocument.Parse(handler.LastRequestBody!);
+        var tool = body.RootElement.GetProperty("tools")[0];
+        Assert.Equal("function", tool.GetProperty("type").GetString());
+        var function = tool.GetProperty("function");
+        Assert.Equal("get_weather", function.GetProperty("name").GetString());
+        Assert.Equal("Weather lookup", function.GetProperty("description").GetString());
+        Assert.Equal(
+            "string",
+            function.GetProperty("parameters").GetProperty("properties").GetProperty("city").GetProperty("type").GetString());
+    }
+
+    [Fact]
+    public async Task CompleteAsync_Status429_ThrowsWithStatusAndRateLimitBody()
+    {
+        const string errorBody = """{"error":{"message":"rate limit exceeded, retry later"}}""";
+        var handler = new FakeHttpMessageHandler(errorBody, HttpStatusCode.TooManyRequests);
+        var model = new OpenAIChatModel(CreateClient(handler), "gpt-4o");
+
+        var ex = await Assert.ThrowsAsync<HttpRequestException>(
+            () => model.CompleteAsync([ChatMessage.User("hi")], []));
+
+        Assert.Equal(HttpStatusCode.TooManyRequests, ex.StatusCode);
+        Assert.Contains("rate limit", ex.Message);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_NonJsonBodyWithOkStatus_ThrowsInvalidOperationException()
+    {
+        // A gateway can answer 200 with an HTML error page; that must not leak a JsonException.
+        var handler = new FakeHttpMessageHandler("<html>bad gateway</html>", contentType: "text/html");
+        var model = new OpenAIChatModel(CreateClient(handler), "gpt-4o");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => model.CompleteAsync([ChatMessage.User("hi")], []));
+
+        Assert.IsType<System.Text.Json.JsonException>(ex.InnerException);
+    }
+
+    [Fact]
+    public async Task StreamAsync_NonJsonEvent_ThrowsInvalidOperationException()
+    {
+        const string sse = "data: <html>oops</html>\n\n";
+        var handler = new FakeHttpMessageHandler(sse, contentType: "text/event-stream", streamContent: true);
+        var model = new OpenAIChatModel(CreateClient(handler), "gpt-4o");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => CollectAsync(model.StreamAsync([ChatMessage.User("hi")], [])));
+
+        Assert.IsType<System.Text.Json.JsonException>(ex.InnerException);
+    }
+
+    [Fact]
+    public async Task StreamAsync_SseChunks_YieldsContentDeltasUntilDone()
+    {
+        const string sse = """
+            data: {"choices":[{"delta":{"content":"one "}}]}
+
+            data: {"choices":[{"delta":{"content":"two "}}]}
+
+            data: {"choices":[{"delta":{"content":"three"}}]}
+
+            data: [DONE]
+
+            data: {"choices":[{"delta":{"content":"after done"}}]}
+
+            """;
+        var handler = new FakeHttpMessageHandler(sse, contentType: "text/event-stream", streamContent: true);
+        var model = new OpenAIChatModel(CreateClient(handler), "gpt-4o");
+
+        var chunks = await CollectAsync(model.StreamAsync([ChatMessage.User("hi")], []));
+
+        Assert.Equal(["one ", "two ", "three"], chunks);
     }
 
     /// <summary>Never answers; only the cancellation token can end the request.</summary>

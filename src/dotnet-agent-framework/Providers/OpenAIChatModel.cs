@@ -98,7 +98,7 @@ public sealed class OpenAIChatModel : IChatModel
     /// <exception cref="HttpRequestException">
     /// The endpoint answered with a non-success status. The message includes the response body.
     /// </exception>
-    /// <exception cref="InvalidOperationException">The response contains no choices or an unusable tool call.</exception>
+    /// <exception cref="InvalidOperationException">The body is not JSON, contains no choices, or has an unusable tool call.</exception>
     public async Task<ChatCompletion> CompleteAsync(
         IReadOnlyList<ChatMessage> messages,
         IReadOnlyList<ToolDefinition> tools,
@@ -129,7 +129,7 @@ public sealed class OpenAIChatModel : IChatModel
                 ex);
         }
 
-        var parsed = JsonSerializer.Deserialize<WireResponse>(json, _serializerOptions)
+        var parsed = DeserializeBody<WireResponse>(json)
             ?? throw new InvalidOperationException("OpenAI-compatible endpoint returned an empty body.");
 
         return ToCompletion(parsed);
@@ -147,8 +147,9 @@ public sealed class OpenAIChatModel : IChatModel
     /// </para>
     /// <para>
     /// <see cref="OpenAIChatModelOptions.RequestTimeout"/> applies only until the response headers arrive. It does
-    /// not cap how long the stream stays open, so a long answer is not cut off. A stalled stream is not detected;
-    /// cancel <paramref name="cancellationToken"/> to stop it.
+    /// not cap how long the stream stays open, so a long answer is not cut off. <see cref="HttpClient.Timeout"/> does
+    /// still apply to the whole response, so set it to <see cref="Timeout.InfiniteTimeSpan"/> for long streams. A
+    /// stalled stream is not detected; cancel <paramref name="cancellationToken"/> to stop it.
     /// </para>
     /// </remarks>
     /// <exception cref="HttpRequestException">
@@ -176,7 +177,7 @@ public sealed class OpenAIChatModel : IChatModel
                 yield break;
             }
 
-            var chunk = JsonSerializer.Deserialize<WireStreamChunk>(data, _serializerOptions);
+            var chunk = DeserializeBody<WireStreamChunk>(data);
             if (chunk?.Choices is not { Count: > 0 } choices || choices[0].Delta is not { } delta)
             {
                 // Usage-only chunks (sent after the content when include_usage is set) have no choices.
@@ -244,6 +245,22 @@ public sealed class OpenAIChatModel : IChatModel
             throw new TimeoutException(
                 $"OpenAI-compatible endpoint did not respond within {_requestTimeout.TotalSeconds:0.#} s.",
                 ex);
+        }
+    }
+
+    /// <summary>
+    /// Deserializes a response body or stream event. Non-JSON content, such as an HTML error page returned with a 200
+    /// status by a gateway, is reported as <see cref="InvalidOperationException"/> like the other unusable responses.
+    /// </summary>
+    private static T? DeserializeBody<T>(string json) where T : class
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<T>(json, _serializerOptions);
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidOperationException("OpenAI-compatible endpoint returned data that is not valid JSON.", ex);
         }
     }
 
