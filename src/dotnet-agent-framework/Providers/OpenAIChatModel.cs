@@ -13,11 +13,12 @@ namespace DotnetAgentFramework;
 /// <see cref="HttpClient"/> and <c>System.Text.Json</c>.
 /// </summary>
 /// <remarks>
-/// This adapter is non-streaming. <see cref="StreamAsync"/> yields the whole completion as one chunk.
+/// <see cref="CompleteAsync"/> sends a single JSON response. <see cref="StreamAsync"/> streams Server-Sent Events.
 /// </remarks>
 public sealed class OpenAIChatModel : IChatModel
 {
     private const string _completionsPath = "chat/completions";
+    private const string _streamDone = "[DONE]";
 
     private static readonly JsonSerializerOptions _serializerOptions = new(JsonSerializerDefaults.Web)
     {
@@ -106,27 +107,7 @@ public sealed class OpenAIChatModel : IChatModel
         ArgumentNullException.ThrowIfNull(messages);
         ArgumentNullException.ThrowIfNull(tools);
 
-        var body = new WireRequest(
-            ModelId,
-            messages.Select(ToWireMessage).ToList(),
-            tools.Count == 0 ? null : tools.Select(ToWireTool).ToList(),
-            Stream: false,
-            Temperature: _temperature,
-            MaxTokens: _maxTokens);
-
-        using var request = new HttpRequestMessage(HttpMethod.Post, _completionsPath)
-        {
-            Content = JsonContent.Create(body, options: _serializerOptions),
-        };
-        foreach (var (name, value) in _defaultHeaders)
-        {
-            request.Headers.TryAddWithoutValidation(name, value);
-        }
-
-        if (_apiKey is not null)
-        {
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
-        }
+        using var request = CreateRequest(messages, tools, stream: false);
 
         // The timeout covers the body read too, so a server that stalls mid-response is cut off as well.
         using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -138,10 +119,7 @@ public sealed class OpenAIChatModel : IChatModel
             json = await response.Content.ReadAsStringAsync(timeoutSource.Token).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
-                throw new HttpRequestException(
-                    $"OpenAI-compatible endpoint returned {(int)response.StatusCode}: {json}",
-                    inner: null,
-                    statusCode: response.StatusCode);
+                throw CreateStatusException(response.StatusCode, json);
             }
         }
         catch (OperationCanceledException ex) when (timeoutSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
@@ -159,20 +137,120 @@ public sealed class OpenAIChatModel : IChatModel
 
     /// <inheritdoc />
     /// <remarks>
-    /// TODO: stream for real (<c>stream: true</c>, parse SSE <c>data:</c> lines). Until the SSE follow-up lands,
-    /// this calls <see cref="CompleteAsync"/> and yields the whole content as a single chunk.
+    /// Sends the request with <c>stream: true</c> and <c>stream_options.include_usage</c>, then reads the
+    /// Server-Sent Events response line by line and yields each non-empty <c>delta.content</c>. Token usage is
+    /// not reported: <see cref="IChatModel.StreamAsync"/> has no channel for it.
+    /// <para>
+    /// If any chunk carries a non-empty <c>delta.tool_calls</c>, the model has chosen to call tools. The stream
+    /// then ends without yielding further text, and the caller should fall back to <see cref="CompleteAsync"/>
+    /// to receive the tool calls. Text yielded before that chunk stays yielded.
+    /// </para>
+    /// <para>
+    /// <see cref="OpenAIChatModelOptions.RequestTimeout"/> applies only until the response headers arrive. It does
+    /// not cap how long the stream stays open, so a long answer is not cut off. A stalled stream is not detected;
+    /// cancel <paramref name="cancellationToken"/> to stop it.
+    /// </para>
     /// </remarks>
+    /// <exception cref="HttpRequestException">
+    /// The endpoint answered with a non-success status. The message includes the response body.
+    /// </exception>
+    /// <exception cref="TimeoutException">No response headers arrived within <see cref="OpenAIChatModelOptions.RequestTimeout"/>.</exception>
     public async IAsyncEnumerable<string> StreamAsync(
         IReadOnlyList<ChatMessage> messages,
         IReadOnlyList<ToolDefinition> tools,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var completion = await CompleteAsync(messages, tools, cancellationToken).ConfigureAwait(false);
-        if (completion.Message.Content.Length > 0)
+        using var request = CreateRequest(messages, tools, stream: true);
+        using var response = await SendHeadersAsync(request, cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
         {
-            yield return completion.Message.Content;
+            var error = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+            throw CreateStatusException(response.StatusCode, error);
+        }
+
+        using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        await foreach (var data in SseParser.ReadDataLinesAsync(stream, cancellationToken).ConfigureAwait(false))
+        {
+            if (data == _streamDone)
+            {
+                yield break;
+            }
+
+            var chunk = JsonSerializer.Deserialize<WireStreamChunk>(data, _serializerOptions);
+            if (chunk?.Choices is not { Count: > 0 } choices || choices[0].Delta is not { } delta)
+            {
+                // Usage-only chunks (sent after the content when include_usage is set) have no choices.
+                continue;
+            }
+
+            if (delta.ToolCalls is { Count: > 0 })
+            {
+                yield break;
+            }
+
+            if (!string.IsNullOrEmpty(delta.Content))
+            {
+                yield return delta.Content;
+            }
         }
     }
+
+    private HttpRequestMessage CreateRequest(
+        IReadOnlyList<ChatMessage> messages,
+        IReadOnlyList<ToolDefinition> tools,
+        bool stream)
+    {
+        var body = new WireRequest(
+            ModelId,
+            messages.Select(ToWireMessage).ToList(),
+            tools.Count == 0 ? null : tools.Select(ToWireTool).ToList(),
+            Stream: stream,
+            StreamOptions: stream ? new WireStreamOptions(IncludeUsage: true) : null,
+            Temperature: _temperature,
+            MaxTokens: _maxTokens);
+
+        var request = new HttpRequestMessage(HttpMethod.Post, _completionsPath)
+        {
+            Content = JsonContent.Create(body, options: _serializerOptions),
+        };
+        foreach (var (name, value) in _defaultHeaders)
+        {
+            request.Headers.TryAddWithoutValidation(name, value);
+        }
+
+        if (_apiKey is not null)
+        {
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
+        }
+
+        return request;
+    }
+
+    /// <summary>
+    /// Sends the request and returns once the response headers arrive. The body is left unread so it can be streamed.
+    /// </summary>
+    private async Task<HttpResponseMessage> SendHeadersAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutSource.CancelAfter(_requestTimeout);
+        try
+        {
+            return await _httpClient
+                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeoutSource.Token)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex) when (timeoutSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                $"OpenAI-compatible endpoint did not respond within {_requestTimeout.TotalSeconds:0.#} s.",
+                ex);
+        }
+    }
+
+    private static HttpRequestException CreateStatusException(HttpStatusCode statusCode, string body) => new(
+        $"OpenAI-compatible endpoint returned {(int)statusCode}: {body}",
+        inner: null,
+        statusCode: statusCode);
 
     private static WireMessage ToWireMessage(ChatMessage message) => new(
         OpenAIWireFormat.RoleName(message.Role),
@@ -231,8 +309,12 @@ public sealed class OpenAIChatModel : IChatModel
         [property: JsonPropertyName("messages")] IReadOnlyList<WireMessage> Messages,
         [property: JsonPropertyName("tools")] IReadOnlyList<WireTool>? Tools,
         [property: JsonPropertyName("stream")] bool Stream,
+        [property: JsonPropertyName("stream_options")] WireStreamOptions? StreamOptions,
         [property: JsonPropertyName("temperature")] double? Temperature,
         [property: JsonPropertyName("max_tokens")] int? MaxTokens);
+
+    private sealed record WireStreamOptions(
+        [property: JsonPropertyName("include_usage")] bool IncludeUsage);
 
     private sealed record WireMessage(
         [property: JsonPropertyName("role")] string? Role,
@@ -268,4 +350,14 @@ public sealed class OpenAIChatModel : IChatModel
     private sealed record WireUsage(
         [property: JsonPropertyName("prompt_tokens")] int? PromptTokens,
         [property: JsonPropertyName("completion_tokens")] int? CompletionTokens);
+
+    private sealed record WireStreamChunk(
+        [property: JsonPropertyName("choices")] IReadOnlyList<WireStreamChoice>? Choices);
+
+    private sealed record WireStreamChoice(
+        [property: JsonPropertyName("delta")] WireDelta? Delta);
+
+    private sealed record WireDelta(
+        [property: JsonPropertyName("content")] string? Content,
+        [property: JsonPropertyName("tool_calls")] IReadOnlyList<WireToolCall>? ToolCalls);
 }

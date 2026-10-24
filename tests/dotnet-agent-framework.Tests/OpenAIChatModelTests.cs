@@ -239,20 +239,169 @@ public class OpenAIChatModelTests
     }
 
     [Fact]
-    public async Task StreamAsync_NonStreaming_YieldsWholeContentOnce()
+    public async Task CompleteAsync_NonStreaming_OmitsStreamOptions()
     {
         var handler = new StubHttpMessageHandler(_textResponse);
         var model = new OpenAIChatModel(CreateClient(handler), "gpt-4o");
 
+        await model.CompleteAsync([ChatMessage.User("hi")], []);
+
+        using var body = JsonDocument.Parse(Assert.Single(handler.RequestBodies));
+        Assert.False(body.RootElement.TryGetProperty("stream_options", out _));
+    }
+
+    [Fact]
+    public async Task StreamAsync_SendsStreamTrueWithIncludeUsage()
+    {
+        var handler = new StubHttpMessageHandler(_textDeltaStream);
+        var model = new OpenAIChatModel(CreateClient(handler), "gpt-4o");
+
+        await CollectAsync(model.StreamAsync([ChatMessage.User("hi")], []));
+
+        var request = Assert.Single(handler.Requests);
+        Assert.Equal(HttpMethod.Post, request.Method);
+        Assert.Equal("https://example.test/v1/chat/completions", request.RequestUri!.AbsoluteUri);
+
+        using var body = JsonDocument.Parse(Assert.Single(handler.RequestBodies));
+        Assert.True(body.RootElement.GetProperty("stream").GetBoolean());
+        Assert.True(body.RootElement.GetProperty("stream_options").GetProperty("include_usage").GetBoolean());
+    }
+
+    [Fact]
+    public async Task StreamAsync_ContentDeltas_YieldedInOrderSkippingEmptyAndNull()
+    {
+        var model = new OpenAIChatModel(CreateClient(new StubHttpMessageHandler(_textDeltaStream)), "gpt-4o");
+
+        var chunks = await CollectAsync(model.StreamAsync([ChatMessage.User("hi")], []));
+
+        // The role-only chunk has null content, the "" chunk is empty, and the usage chunk has no choices.
+        Assert.Equal(["Hel", "lo", " there"], chunks);
+    }
+
+    [Fact]
+    public async Task StreamAsync_DoneMarker_StopsReadingFurtherData()
+    {
+        const string body = "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\n" +
+                            "data: [DONE]\n\n" +
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"B\"}}]}\n\n";
+        var model = new OpenAIChatModel(CreateClient(new StubHttpMessageHandler(body)), "gpt-4o");
+
+        var chunks = await CollectAsync(model.StreamAsync([ChatMessage.User("hi")], []));
+
+        Assert.Equal(["A"], chunks);
+    }
+
+    [Fact]
+    public async Task StreamAsync_ToolCallDelta_EndsStreamWithoutFurtherText()
+    {
+        const string body = """
+            data: {"choices":[{"delta":{"content":"Let me check. "}}]}
+
+            data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}
+
+            data: {"choices":[{"delta":{"content":"should not appear"}}]}
+
+            data: [DONE]
+
+            """;
+        var model = new OpenAIChatModel(CreateClient(new StubHttpMessageHandler(body)), "gpt-4o");
+
+        var chunks = await CollectAsync(model.StreamAsync([ChatMessage.User("weather?")], [_weatherTool]));
+
+        Assert.Equal(["Let me check. "], chunks);
+    }
+
+    [Fact]
+    public async Task StreamAsync_EmptyToolCallsArray_IsNotAToolCall()
+    {
+        const string body = """
+            data: {"choices":[{"delta":{"content":"Hi","tool_calls":[]}}]}
+
+            data: {"choices":[{"delta":{"content":"!","tool_calls":[]}}]}
+
+            data: [DONE]
+
+            """;
+        var model = new OpenAIChatModel(CreateClient(new StubHttpMessageHandler(body)), "gpt-4o");
+
+        var chunks = await CollectAsync(model.StreamAsync([ChatMessage.User("hi")], []));
+
+        Assert.Equal(["Hi", "!"], chunks);
+    }
+
+    [Fact]
+    public async Task StreamAsync_NonSuccessStatus_ThrowsWithStatusAndBody()
+    {
+        const string errorBody = """{"error":{"message":"invalid model"}}""";
+        var model = new OpenAIChatModel(
+            CreateClient(new StubHttpMessageHandler(errorBody, HttpStatusCode.Unauthorized)),
+            "gpt-4o");
+
+        var ex = await Assert.ThrowsAsync<HttpRequestException>(
+            () => CollectAsync(model.StreamAsync([ChatMessage.User("hi")], [])));
+
+        Assert.Equal(HttpStatusCode.Unauthorized, ex.StatusCode);
+        Assert.Equal($"OpenAI-compatible endpoint returned 401: {errorBody}", ex.Message);
+    }
+
+    [Fact]
+    public async Task StreamAsync_CancelledToken_ThrowsOperationCanceled()
+    {
+        var model = new OpenAIChatModel(CreateClient(new StubHttpMessageHandler(_textDeltaStream)), "gpt-4o");
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => CollectAsync(model.StreamAsync([ChatMessage.User("hi")], [], cts.Token)));
+    }
+
+    [Fact]
+    public async Task StreamAsync_ResponseHeadersElapse_ThrowsTimeoutException()
+    {
+        using var client = new HttpClient(new HangingHandler()) { BaseAddress = new Uri("https://example.test/v1/") };
+        var model = new OpenAIChatModel(client, new OpenAIChatModelOptions
+        {
+            ModelId = "gpt-4o",
+            RequestTimeout = TimeSpan.FromMilliseconds(100),
+        });
+
+        var ex = await Assert.ThrowsAsync<TimeoutException>(
+            () => CollectAsync(model.StreamAsync([ChatMessage.User("hi")], [])));
+
+        Assert.Contains("did not respond within 0.1 s", ex.Message);
+    }
+
+    private const string _textDeltaStream = """
+        data: {"choices":[{"index":0,"delta":{"role":"assistant","content":null}}]}
+
+        data: {"choices":[{"index":0,"delta":{"content":"Hel"}}]}
+
+        data: {"choices":[{"index":0,"delta":{"content":""}}]}
+
+        data: {"choices":[{"index":0,"delta":{"content":"lo"}}]}
+
+        data: {"choices":[{"index":0,"delta":{"content":" there"},"finish_reason":"stop"}]}
+
+        data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}
+
+        data: [DONE]
+
+        """;
+
+    private static readonly ToolDefinition _weatherTool = ToolDefinition.Create(
+        "get_weather",
+        "Weather lookup",
+        JsonDocument.Parse("""{"type":"object"}""").RootElement.Clone());
+
+    private static async Task<List<string>> CollectAsync(IAsyncEnumerable<string> stream)
+    {
         var chunks = new List<string>();
-        await foreach (var chunk in model.StreamAsync([ChatMessage.User("hi")], []))
+        await foreach (var chunk in stream)
         {
             chunks.Add(chunk);
         }
 
-        Assert.Equal(["Hello there"], chunks);
-        using var body = JsonDocument.Parse(Assert.Single(handler.RequestBodies));
-        Assert.False(body.RootElement.GetProperty("stream").GetBoolean());
+        return chunks;
     }
 
     [Fact]
