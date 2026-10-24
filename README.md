@@ -36,7 +36,7 @@ public sealed class WeatherTool : Tool<WeatherArgs>
 }
 
 // 2. Wire up a model (any IChatModel implementation) and run
-IChatModel model = new OpenAIChatModel(new HttpClient(), "gpt-4o", apiKey);
+IChatModel model = new OpenAIChatModel(new HttpClient(), "gpt-4o-mini", apiKey);
 
 var agent = new Agent(
     model,
@@ -214,6 +214,117 @@ public sealed class LastNAgentMemory(int maxMessages) : IAgentMemory
 }
 ```
 
+## Model providers
+
+`OpenAIChatModel` speaks the OpenAI `/chat/completions` protocol, so one class covers several providers. `BaseAddress` picks the endpoint (it must end with `/`), `ApiKey` is sent as a Bearer token when set, and `DefaultHeaders` adds extra headers to every request.
+
+OpenAI (the default `BaseAddress` is `https://api.openai.com/v1/`):
+
+```csharp
+IChatModel model = new OpenAIChatModel(new HttpClient(), new OpenAIChatModelOptions
+{
+    ModelId = "gpt-4o-mini",
+    ApiKey = apiKey,
+});
+```
+
+Ollama, which needs no key, so `ApiKey` stays null:
+
+```csharp
+IChatModel model = new OpenAIChatModel(new HttpClient(), new OpenAIChatModelOptions
+{
+    ModelId = "llama3.1",
+    BaseAddress = new Uri("http://localhost:11434/v1/"),
+});
+```
+
+Azure OpenAI, with the key in the `api-key` header instead of a Bearer token. `ModelId` is the deployment name, and the adapter appends no query string, so the endpoint must accept `chat/completions` without an `api-version` parameter:
+
+```csharp
+IChatModel model = new OpenAIChatModel(new HttpClient(), new OpenAIChatModelOptions
+{
+    ModelId = "gpt-4o-mini",
+    BaseAddress = new Uri("https://my-resource.openai.azure.com/openai/deployments/my-deployment/"),
+    DefaultHeaders = new Dictionary<string, string> { ["api-key"] = azureKey },
+});
+```
+
+Implementing `IChatModel` for another provider:
+
+Implement `CompleteAsync` to translate the framework's `ChatMessage` and `ToolDefinition` lists into the provider's wire format, then map the reply back. Tool requests go on the assistant message as `ToolCalls` (`ChatMessage.Assistant(string.Empty, toolCalls)` is a valid reply with no text). `StreamAsync` yields text deltas for the final answer. When the model requests tools, end the stream without yielding more text, and the caller falls back to `CompleteAsync`. Report `TokenUsage` on `ChatCompletion.Usage` whenever the provider returns it: `AgentResult.Usage` sums these values, and a null `Usage` counts as zero.
+
+## Observability
+
+Set `AgentOptions.Observer` to receive run, step, model and tool events. `ConsoleAgentObserver` writes one line per event:
+
+```csharp
+var agent = new Agent(model, tools: [new WeatherTool()], options: new AgentOptions
+{
+    Observer = new ConsoleAgentObserver(),
+});
+```
+
+For logging or metrics of your own, `DelegateAgentObserver` forwards events to the delegates you set. Events without a delegate are ignored:
+
+```csharp
+var observer = new DelegateAgentObserver
+{
+    ToolCompleted = (step, call, result, elapsed) =>
+        logger.LogInformation("Step {Step}: {Tool} took {Ms} ms", step, call.Name, elapsed.TotalMilliseconds),
+    RunFailed = ex => logger.LogError(ex, "Agent run failed"),
+};
+
+var agent = new Agent(model, tools: [new WeatherTool()], options: new AgentOptions { Observer = observer });
+```
+
+Hooks run synchronously on the run loop and must return quickly. With `ParallelToolCalls` on, tool hooks can run on several threads at once. An exception thrown by a hook is swallowed and does not change the run.
+
+## Dependency injection
+
+`AddAgentFramework` registers `AgentOptions` and a scoped `Agent`. Tools and the model are registered separately:
+
+```csharp
+services.AddAgentFramework(o => o.MaxSteps = 8)
+    .AddOpenAIChatModel(o =>
+    {
+        o.ModelId = "gpt-4o-mini";
+        o.ApiKey = configuration["OpenAI:ApiKey"];
+    })
+    .AddTool<WeatherTool>();
+```
+
+`IChatModel` and `ITool` are singletons, so they must be thread-safe. `Agent` and `IAgentMemory` are scoped, so each scope (for example each HTTP request) gets its own conversation. Resolve the agent from a scope:
+
+```csharp
+await using var scope = provider.CreateAsyncScope();
+Agent agent = scope.ServiceProvider.GetRequiredService<Agent>();
+AgentResult result = await agent.RunAsync("Should I bring a jacket to Sofia tonight?");
+```
+
+`AddAgentMemory<TMemory>()` replaces the default `InMemoryAgentMemory` with a scoped memory type.
+
+## Testing your agent
+
+`ScriptedChatModel` (namespace `DotnetAgentFramework.Testing`) replays a queued script, one completion per model call, and records every prompt it receives. The script below asks for a tool call and then answers, using the `WeatherTool` from the quick start:
+
+```csharp
+using DotnetAgentFramework;
+using DotnetAgentFramework.Testing;
+
+var model = new ScriptedChatModel()
+    .CallTool("get_weather", new { city = "Sofia" })
+    .Answer("Bring a jacket.");
+
+var agent = new Agent(model, tools: [new WeatherTool()]);
+AgentResult result = await agent.RunAsync("Should I bring a jacket to Sofia?");
+
+Assert.Equal(2, result.Steps);
+Assert.Equal("Bring a jacket.", result.FinalAnswer);
+Assert.Contains(model.Prompts[1], m => m.Role == MessageRole.Tool && m.Content.Contains("Sofia"));
+```
+
+Calling a model whose script is exhausted throws `InvalidOperationException`, which names the last user message, so a missing script is easy to spot.
+
 ## Installation
 
 ```bash
@@ -256,6 +367,13 @@ Implemented: the reason-act loop (`Agent.RunAsync`, `Agent.StreamAsync`) with `M
 Not implemented yet: a native Anthropic adapter and a vector recall memory.
 
 See [issues](https://github.com/Sarmkadan/dotnet-agent-framework/issues) for the roadmap.
+
+## Design notes
+
+- **One loop, four seams.** `Agent.RunAsync` is the only loop. It talks to the outside world through four interfaces: `IChatModel` (the model), `ITool` (the functions it can call), `IAgentMemory` (the transcript) and `IAgentObserver` (the hooks). Each can be replaced without touching the others.
+- **Small dependency surface.** The core uses `System.Text.Json` from the framework and references only `Microsoft.Extensions.DependencyInjection.Abstractions` and `Microsoft.Extensions.Options`. No provider SDK is referenced; provider adapters are plain `HttpClient` code.
+- **Memory owns truncation.** The loop never trims history. Whatever a memory returns from `RecallAsync` is the prompt, so windowing, token budgets and summaries are memory implementations.
+- **Tools report errors as text.** A failing or unknown tool call becomes a `Error: ...` tool result that the model reads and can recover from. A tool failure never ends the run; caller cancellation, a model error or `MaxSteps` does.
 
 ## Contributing
 
