@@ -58,7 +58,15 @@ public sealed class Agent
     /// <param name="tools">Tools available to the model. Names must be unique.</param>
     /// <param name="memory">Conversation memory. Defaults to <see cref="InMemoryAgentMemory"/>.</param>
     /// <param name="options">Loop configuration. Defaults to <see cref="AgentOptions"/> defaults.</param>
-    /// <exception cref="ArgumentException">Two tools share the same name.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="model"/> or <paramref name="tools"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="tools"/> contains a <see langword="null"/> entry, a tool whose name is <see langword="null"/>
+    /// or whitespace, or two tools that share the same name.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <see cref="AgentOptions.MaxSteps"/> is less than 1, or <see cref="AgentOptions.ToolTimeout"/> is set to a
+    /// non-positive value.
+    /// </exception>
     public Agent(
         IChatModel model,
         IEnumerable<ITool> tools,
@@ -68,11 +76,41 @@ public sealed class Agent
         ArgumentNullException.ThrowIfNull(model);
         ArgumentNullException.ThrowIfNull(tools);
 
+        options ??= new AgentOptions();
+        ValidateOptions(options);
+
+        var toolList = tools.ToList();
+        var toolsByName = new Dictionary<string, ITool>(toolList.Count, StringComparer.Ordinal);
+        var toolDefinitions = new List<ToolDefinition>(toolList.Count);
+        foreach (var tool in toolList)
+        {
+            if (tool is null)
+            {
+                throw new ArgumentException("Tools collection contains a null entry.", nameof(tools));
+            }
+
+            var definition = tool.Definition;
+            var name = definition.Name;
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                throw new ArgumentException(
+                    $"Tool of type '{tool.GetType().FullName}' has a null or whitespace name.",
+                    nameof(tools));
+            }
+
+            if (!toolsByName.TryAdd(name, tool))
+            {
+                throw new ArgumentException($"Duplicate tool name '{name}'.", nameof(tools));
+            }
+
+            toolDefinitions.Add(definition);
+        }
+
         _model = model;
         _memory = memory ?? new InMemoryAgentMemory();
-        _options = options ?? new AgentOptions();
-        _tools = tools.ToDictionary(t => t.Definition.Name, StringComparer.Ordinal);
-        _toolDefinitions = _tools.Values.Select(t => t.Definition).ToList();
+        _options = options;
+        _tools = toolsByName;
+        _toolDefinitions = toolDefinitions;
     }
 
     /// <summary>
@@ -91,12 +129,14 @@ public sealed class Agent
     /// <param name="input">User message that starts (or continues) the conversation.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>Final answer, transcript and aggregate usage.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="input"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException"><paramref name="input"/> is empty or whitespace.</exception>
     /// <exception cref="AgentStepLimitExceededException">
     /// The model kept requesting tools after <see cref="AgentOptions.MaxSteps"/> iterations.
     /// </exception>
     public async Task<AgentResult> RunAsync(string input, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(input);
+        ArgumentException.ThrowIfNullOrWhiteSpace(input);
 
         var transcript = new List<ChatMessage>();
         var usage = default(TokenUsage);
@@ -141,20 +181,27 @@ public sealed class Agent
     /// <see cref="IChatModel.StreamAsync"/> so callers receive the answer token by token. The
     /// answer is appended to memory only after the stream completes; if the caller stops
     /// enumerating early or the token is cancelled, nothing is recorded for that answer.
+    /// Input is validated when this method is called, not when the returned sequence is first enumerated.
     /// </remarks>
     /// <param name="input">User message that starts (or continues) the conversation.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>Text deltas of the final answer.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="input"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException"><paramref name="input"/> is empty or whitespace.</exception>
     /// <exception cref="AgentStepLimitExceededException">
-    /// The model kept requesting tools after <see cref="AgentOptions.MaxSteps"/> iterations.
+    /// Raised while enumerating: the model kept requesting tools after <see cref="AgentOptions.MaxSteps"/> iterations.
     /// </exception>
-    public async IAsyncEnumerable<string> StreamAsync(
-        string input,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public IAsyncEnumerable<string> StreamAsync(string input, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(input);
+        ArgumentException.ThrowIfNullOrWhiteSpace(input);
 
+        return StreamCoreAsync(input, cancellationToken);
+    }
+
+    private async IAsyncEnumerable<string> StreamCoreAsync(
+        string input,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
         await _memory.AppendAsync(ChatMessage.User(input), cancellationToken).ConfigureAwait(false);
 
         IReadOnlyList<ChatMessage>? finalPrompt = null;
@@ -195,6 +242,22 @@ public sealed class Agent
         }
 
         await _memory.AppendAsync(ChatMessage.Assistant(builder.ToString()), cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void ValidateOptions(AgentOptions options)
+    {
+        if (options.MaxSteps < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), options.MaxSteps, "MaxSteps must be at least 1.");
+        }
+
+        if (options.ToolTimeout is { } timeout && timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                timeout,
+                "ToolTimeout must be positive when set. Use null to disable the timeout.");
+        }
     }
 
     private async Task AppendAsync(ChatMessage message, List<ChatMessage> transcript, CancellationToken cancellationToken)
@@ -283,10 +346,13 @@ public sealed class Agent
 public sealed class AgentStepLimitExceededException : Exception
 {
     /// <summary>Creates the exception.</summary>
-    /// <param name="maxSteps">The limit that was exceeded.</param>
+    /// <param name="maxSteps">The limit that was exceeded. Must be at least 1.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxSteps"/> is less than 1.</exception>
     public AgentStepLimitExceededException(int maxSteps)
         : base($"Agent exceeded the maximum of {maxSteps} reasoning steps without producing a final answer.")
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxSteps, 1);
+
         MaxSteps = maxSteps;
     }
 
