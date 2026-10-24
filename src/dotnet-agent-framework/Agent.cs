@@ -34,6 +34,29 @@ public sealed class AgentOptions
     /// Per-tool-invocation timeout. <see langword="null"/> disables the timeout.
     /// </summary>
     public TimeSpan? ToolTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Checks the loop settings and throws for the first rule that is broken.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <see cref="MaxSteps"/> is less than 1, or <see cref="ToolTimeout"/> is set to a non-positive value.
+    /// </exception>
+    public void Validate()
+    {
+        // The name is "options" because that is the parameter callers pass these through (see Agent's constructor).
+        if (MaxSteps < 1)
+        {
+            throw new ArgumentOutOfRangeException("options", MaxSteps, "MaxSteps must be at least 1.");
+        }
+
+        if (ToolTimeout is { } timeout && timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                "options",
+                timeout,
+                "ToolTimeout must be positive when set. Use null to disable the timeout.");
+        }
+    }
 }
 
 /// <summary>
@@ -77,7 +100,7 @@ public sealed class Agent
         ArgumentNullException.ThrowIfNull(tools);
 
         options ??= new AgentOptions();
-        ValidateOptions(options);
+        options.Validate();
 
         var toolList = tools.ToList();
         var toolsByName = new Dictionary<string, ITool>(toolList.Count, StringComparer.Ordinal);
@@ -242,22 +265,6 @@ public sealed class Agent
         }
 
         await _memory.AppendAsync(ChatMessage.Assistant(builder.ToString()), cancellationToken).ConfigureAwait(false);
-    }
-
-    private static void ValidateOptions(AgentOptions options)
-    {
-        if (options.MaxSteps < 1)
-        {
-            throw new ArgumentOutOfRangeException(nameof(options), options.MaxSteps, "MaxSteps must be at least 1.");
-        }
-
-        if (options.ToolTimeout is { } timeout && timeout <= TimeSpan.Zero)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(options),
-                timeout,
-                "ToolTimeout must be positive when set. Use null to disable the timeout.");
-        }
     }
 
     private ChatMessage ValidateModelMessage(ChatMessage message)

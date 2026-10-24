@@ -17,7 +17,6 @@ namespace DotnetAgentFramework;
 /// </remarks>
 public sealed class OpenAIChatModel : IChatModel
 {
-    private const string _defaultBaseAddress = "https://api.openai.com/v1/";
     private const string _completionsPath = "chat/completions";
 
     private static readonly JsonSerializerOptions _serializerOptions = new(JsonSerializerDefaults.Web)
@@ -27,6 +26,10 @@ public sealed class OpenAIChatModel : IChatModel
 
     private readonly HttpClient _httpClient;
     private readonly string? _apiKey;
+    private readonly double? _temperature;
+    private readonly int? _maxTokens;
+    private readonly TimeSpan _requestTimeout;
+    private readonly KeyValuePair<string, string>[] _defaultHeaders;
 
     /// <summary>
     /// Creates an adapter bound to one model on one endpoint.
@@ -45,15 +48,32 @@ public sealed class OpenAIChatModel : IChatModel
     /// <paramref name="modelId"/> or <paramref name="apiKey"/> is empty or whitespace, or the base address does not end with '/'.
     /// </exception>
     public OpenAIChatModel(HttpClient httpClient, string modelId, string? apiKey = null)
+        : this(httpClient, new OpenAIChatModelOptions { ModelId = modelId, ApiKey = apiKey })
+    {
+    }
+
+    /// <summary>
+    /// Creates an adapter from full options. The options are validated and copied, so later changes to them
+    /// have no effect on this instance.
+    /// </summary>
+    /// <param name="httpClient">
+    /// Client used for every request. When <see cref="HttpClient.BaseAddress"/> is null it is set to
+    /// <see cref="OpenAIChatModelOptions.BaseAddress"/>. Otherwise it must end with '/', so that <c>chat/completions</c>
+    /// resolves beneath it instead of replacing the last segment.
+    /// </param>
+    /// <param name="options">Model, endpoint and request settings.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="httpClient"/> or <paramref name="options"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">
+    /// An option is invalid (see <see cref="OpenAIChatModelOptions.Validate"/>), or the client's base address does not end with '/'.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException">An option is out of range (see <see cref="OpenAIChatModelOptions.Validate"/>).</exception>
+    public OpenAIChatModel(HttpClient httpClient, OpenAIChatModelOptions options)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
-        ArgumentException.ThrowIfNullOrWhiteSpace(modelId);
-        if (apiKey is not null)
-        {
-            ArgumentException.ThrowIfNullOrWhiteSpace(apiKey);
-        }
+        ArgumentNullException.ThrowIfNull(options);
+        options.Validate();
 
-        httpClient.BaseAddress ??= new Uri(_defaultBaseAddress);
+        httpClient.BaseAddress ??= options.BaseAddress;
         if (!httpClient.BaseAddress.AbsoluteUri.EndsWith('/'))
         {
             throw new ArgumentException(
@@ -62,8 +82,12 @@ public sealed class OpenAIChatModel : IChatModel
         }
 
         _httpClient = httpClient;
-        _apiKey = apiKey;
-        ModelId = modelId;
+        _apiKey = options.ApiKey;
+        _temperature = options.Temperature;
+        _maxTokens = options.MaxTokens;
+        _requestTimeout = options.RequestTimeout;
+        _defaultHeaders = options.DefaultHeaders.ToArray();
+        ModelId = options.ModelId;
     }
 
     /// <inheritdoc />
@@ -86,25 +110,45 @@ public sealed class OpenAIChatModel : IChatModel
             ModelId,
             messages.Select(ToWireMessage).ToList(),
             tools.Count == 0 ? null : tools.Select(ToWireTool).ToList(),
-            Stream: false);
+            Stream: false,
+            Temperature: _temperature,
+            MaxTokens: _maxTokens);
 
         using var request = new HttpRequestMessage(HttpMethod.Post, _completionsPath)
         {
             Content = JsonContent.Create(body, options: _serializerOptions),
         };
+        foreach (var (name, value) in _defaultHeaders)
+        {
+            request.Headers.TryAddWithoutValidation(name, value);
+        }
+
         if (_apiKey is not null)
         {
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
         }
 
-        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
-        var json = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
+        // The timeout covers the body read too, so a server that stalls mid-response is cut off as well.
+        using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutSource.CancelAfter(_requestTimeout);
+        string json;
+        try
         {
-            throw new HttpRequestException(
-                $"OpenAI-compatible endpoint returned {(int)response.StatusCode}: {json}",
-                inner: null,
-                statusCode: response.StatusCode);
+            using var response = await _httpClient.SendAsync(request, timeoutSource.Token).ConfigureAwait(false);
+            json = await response.Content.ReadAsStringAsync(timeoutSource.Token).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new HttpRequestException(
+                    $"OpenAI-compatible endpoint returned {(int)response.StatusCode}: {json}",
+                    inner: null,
+                    statusCode: response.StatusCode);
+            }
+        }
+        catch (OperationCanceledException ex) when (timeoutSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                $"OpenAI-compatible endpoint did not respond within {_requestTimeout.TotalSeconds:0.#} s.",
+                ex);
         }
 
         var parsed = JsonSerializer.Deserialize<WireResponse>(json, _serializerOptions)
@@ -186,7 +230,9 @@ public sealed class OpenAIChatModel : IChatModel
         [property: JsonPropertyName("model")] string Model,
         [property: JsonPropertyName("messages")] IReadOnlyList<WireMessage> Messages,
         [property: JsonPropertyName("tools")] IReadOnlyList<WireTool>? Tools,
-        [property: JsonPropertyName("stream")] bool Stream);
+        [property: JsonPropertyName("stream")] bool Stream,
+        [property: JsonPropertyName("temperature")] double? Temperature,
+        [property: JsonPropertyName("max_tokens")] int? MaxTokens);
 
     private sealed record WireMessage(
         [property: JsonPropertyName("role")] string? Role,

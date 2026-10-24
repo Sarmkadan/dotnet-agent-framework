@@ -254,4 +254,98 @@ public class OpenAIChatModelTests
         using var body = JsonDocument.Parse(Assert.Single(handler.RequestBodies));
         Assert.False(body.RootElement.GetProperty("stream").GetBoolean());
     }
+
+    [Fact]
+    public async Task CompleteAsync_TemperatureAndMaxTokensSet_SendsBothFields()
+    {
+        var handler = new StubHttpMessageHandler(_textResponse);
+        using var client = CreateClient(handler);
+        var model = new OpenAIChatModel(client, new OpenAIChatModelOptions
+        {
+            ModelId = "gpt-4o",
+            Temperature = 0.2,
+            MaxTokens = 64,
+        });
+
+        await model.CompleteAsync([ChatMessage.User("hi")], []);
+
+        using var body = JsonDocument.Parse(Assert.Single(handler.RequestBodies));
+        Assert.Equal(0.2, body.RootElement.GetProperty("temperature").GetDouble());
+        Assert.Equal(64, body.RootElement.GetProperty("max_tokens").GetInt32());
+    }
+
+    [Fact]
+    public async Task CompleteAsync_TemperatureAndMaxTokensUnset_OmitsBothFields()
+    {
+        var handler = new StubHttpMessageHandler(_textResponse);
+        using var client = CreateClient(handler);
+        var model = new OpenAIChatModel(client, new OpenAIChatModelOptions { ModelId = "gpt-4o" });
+
+        await model.CompleteAsync([ChatMessage.User("hi")], []);
+
+        using var body = JsonDocument.Parse(Assert.Single(handler.RequestBodies));
+        Assert.False(body.RootElement.TryGetProperty("temperature", out _));
+        Assert.False(body.RootElement.TryGetProperty("max_tokens", out _));
+    }
+
+    [Fact]
+    public async Task CompleteAsync_DefaultHeaders_SentOnEveryRequest()
+    {
+        var handler = new StubHttpMessageHandler(_textResponse);
+        using var client = CreateClient(handler);
+        var model = new OpenAIChatModel(client, new OpenAIChatModelOptions
+        {
+            ModelId = "gpt-4o",
+            DefaultHeaders = new Dictionary<string, string> { ["api-key"] = "az-key" },
+        });
+
+        await model.CompleteAsync([ChatMessage.User("one")], []);
+        await model.CompleteAsync([ChatMessage.User("two")], []);
+
+        Assert.All(handler.Requests, request =>
+            Assert.Equal("az-key", Assert.Single(request.Headers.GetValues("api-key"))));
+    }
+
+    [Fact]
+    public void Constructor_OptionsBaseAddressAppliedWhenClientHasNone()
+    {
+        using var client = new HttpClient();
+
+        _ = new OpenAIChatModel(client, new OpenAIChatModelOptions
+        {
+            ModelId = "llama3.1",
+            BaseAddress = new Uri("http://localhost:11434/v1/"),
+        });
+
+        Assert.Equal("http://localhost:11434/v1/", client.BaseAddress!.AbsoluteUri);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_RequestTimeoutElapses_ThrowsTimeoutException()
+    {
+        using var client = new HttpClient(new HangingHandler()) { BaseAddress = new Uri("https://example.test/v1/") };
+        var model = new OpenAIChatModel(client, new OpenAIChatModelOptions
+        {
+            ModelId = "gpt-4o",
+            RequestTimeout = TimeSpan.FromMilliseconds(100),
+        });
+
+        var ex = await Assert.ThrowsAsync<TimeoutException>(
+            () => model.CompleteAsync([ChatMessage.User("hi")], []));
+
+        Assert.Contains("did not respond within 0.1 s", ex.Message);
+        Assert.IsAssignableFrom<OperationCanceledException>(ex.InnerException);
+    }
+
+    /// <summary>Never answers; only the cancellation token can end the request.</summary>
+    private sealed class HangingHandler : HttpMessageHandler
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+            return new HttpResponseMessage();
+        }
+    }
 }
