@@ -1,5 +1,4 @@
 using System.Text.Json;
-using System.Text.Json.Serialization;
 
 namespace DotnetAgentFramework;
 
@@ -35,12 +34,6 @@ public interface ITool
 public abstract class Tool<TArgs> : ITool
     where TArgs : class
 {
-    // Enums are advertised as string names by JsonSchemaGenerator, so they must also be read from strings.
-    private static readonly JsonSerializerOptions s_jsonOptions = new(JsonSerializerDefaults.Web)
-    {
-        Converters = { new JsonStringEnumConverter() },
-    };
-
     // Per closed generic type, so reflection runs once for each TArgs.
     private static readonly Lazy<JsonElement> s_schema = new(() => JsonSchemaGenerator.Generate(typeof(TArgs)));
 
@@ -68,24 +61,12 @@ public abstract class Tool<TArgs> : ITool
     /// </remarks>
     public Task<string> InvokeAsync(JsonElement arguments, CancellationToken cancellationToken = default)
     {
-        if (arguments.ValueKind != JsonValueKind.Object)
+        if (!ToolArguments.TryDeserialize(arguments, out TArgs? args, out string? error))
         {
-            return Task.FromResult($"Error: tool '{Name}' expected a JSON object but received {arguments.ValueKind}.");
+            return Task.FromResult($"Error: tool '{Name}' {error}");
         }
 
-        TArgs? args;
-        try
-        {
-            args = arguments.Deserialize<TArgs>(s_jsonOptions);
-        }
-        catch (JsonException ex)
-        {
-            return Task.FromResult($"Error: tool '{Name}' received arguments that could not be deserialized: {ex.Message}");
-        }
-
-        return InvokeAsync(
-            args ?? throw new ArgumentException($"Tool '{Name}' received null arguments.", nameof(arguments)),
-            cancellationToken);
+        return InvokeAsync(args!, cancellationToken);
     }
 
     /// <summary>

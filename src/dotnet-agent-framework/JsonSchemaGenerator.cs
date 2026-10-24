@@ -13,6 +13,16 @@ namespace DotnetAgentFramework;
 internal static class JsonSchemaGenerator
 {
     /// <summary>
+    /// Schema for a tool that takes no arguments: an object with no properties and no extra properties allowed.
+    /// </summary>
+    internal static readonly JsonElement EmptyObjectSchema = JsonSerializer.SerializeToElement(new JsonObject
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject(),
+        ["additionalProperties"] = false,
+    });
+
+    /// <summary>
     /// Generates a JSON Schema describing <paramref name="type"/>.
     /// </summary>
     /// <param name="type">Type to describe. Classes and records produce an object schema.</param>

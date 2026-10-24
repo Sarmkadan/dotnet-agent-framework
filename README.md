@@ -23,7 +23,7 @@ No opinionated pipeline, no plugin marketplace, no YAML. Four interfaces and one
 using System.Text.Json;
 using DotnetAgentFramework;
 
-// 1. A tool the model can call
+// 1. A tool the model can call. Derive from Tool<TArgs> as below, or use DelegateTool.Create<TArgs>(...) for an inline tool without a class.
 public sealed record WeatherArgs(string City);
 
 public sealed class WeatherTool : Tool<WeatherArgs>
