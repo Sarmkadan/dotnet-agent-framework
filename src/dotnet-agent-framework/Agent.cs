@@ -34,6 +34,8 @@ public sealed class AgentOptions
 /// </summary>
 public sealed class Agent
 {
+    private const string ToolErrorPrefix = "Error: ";
+
     private readonly IChatModel _model;
     private readonly IAgentMemory _memory;
     private readonly IReadOnlyDictionary<string, ITool> _tools;
@@ -150,9 +152,37 @@ public sealed class Agent
 
     private async Task<ChatMessage> ExecuteToolCallAsync(ToolCall call, CancellationToken cancellationToken)
     {
-        var tool = _tools[call.Name];
-        var result = await tool.InvokeAsync(call.Arguments, cancellationToken).ConfigureAwait(false);
-        return ChatMessage.ToolResult(call.Id, result);
+        if (!_tools.TryGetValue(call.Name, out var tool))
+        {
+            return ChatMessage.ToolResult(
+                call.Id,
+                $"{ToolErrorPrefix}unknown tool '{call.Name}'. Available tools: {string.Join(", ", _tools.Keys)}");
+        }
+
+        var timeout = _options.ToolTimeout;
+        using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (timeout is { } limit)
+        {
+            timeoutSource.CancelAfter(limit);
+        }
+
+        try
+        {
+            var result = await tool.InvokeAsync(call.Arguments, timeoutSource.Token).ConfigureAwait(false);
+            return ChatMessage.ToolResult(call.Id, result);
+        }
+        catch (OperationCanceledException) when (timeoutSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            return ChatMessage.ToolResult(
+                call.Id,
+                $"{ToolErrorPrefix}tool '{call.Name}' timed out after {timeout.GetValueOrDefault().TotalSeconds:0.#}s");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            return ChatMessage.ToolResult(
+                call.Id,
+                $"{ToolErrorPrefix}tool '{call.Name}' failed: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 }
 
