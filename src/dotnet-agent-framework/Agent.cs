@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text;
 
@@ -36,6 +37,12 @@ public sealed class AgentOptions
     public TimeSpan? ToolTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
+    /// Receives run, step, model and tool events. <see langword="null"/> disables observation. The value is read
+    /// when the <see cref="Agent"/> is constructed, so changing it afterwards has no effect on that agent.
+    /// </summary>
+    public IAgentObserver? Observer { get; set; }
+
+    /// <summary>
     /// Checks the loop settings and throws for the first rule that is broken.
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException">
@@ -72,6 +79,7 @@ public sealed class Agent
     private readonly IAgentMemory _memory;
     private readonly IReadOnlyDictionary<string, ITool> _tools;
     private readonly AgentOptions _options;
+    private readonly IAgentObserver _observer;
     private readonly IReadOnlyList<ToolDefinition> _toolDefinitions;
 
     /// <summary>
@@ -132,6 +140,7 @@ public sealed class Agent
         _model = model;
         _memory = memory ?? new InMemoryAgentMemory();
         _options = options;
+        _observer = options.Observer ?? NullAgentObserver.Instance;
         _tools = toolsByName;
         _toolDefinitions = toolDefinitions;
     }
@@ -161,36 +170,50 @@ public sealed class Agent
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(input);
 
-        var transcript = new List<ChatMessage>();
-        var usage = default(TokenUsage);
-
-        var userMessage = ChatMessage.User(input);
-        await AppendAsync(userMessage, transcript, cancellationToken).ConfigureAwait(false);
-
-        for (var step = 1; step <= _options.MaxSteps; step++)
+        Notify(observer => observer.OnRunStarted(input));
+        try
         {
-            var messages = await BuildPromptAsync(input, cancellationToken).ConfigureAwait(false);
+            var transcript = new List<ChatMessage>();
+            var usage = default(TokenUsage);
 
-            var completion = await _model.CompleteAsync(messages, _toolDefinitions, cancellationToken)
-                .ConfigureAwait(false);
-            usage += completion.Usage ?? default;
+            var userMessage = ChatMessage.User(input);
+            await AppendAsync(userMessage, transcript, cancellationToken).ConfigureAwait(false);
 
-            var assistant = ValidateModelMessage(completion.Message);
-            await AppendAsync(assistant, transcript, cancellationToken).ConfigureAwait(false);
-
-            if (assistant.ToolCalls is null || assistant.ToolCalls.Count == 0)
+            for (var step = 1; step <= _options.MaxSteps; step++)
             {
-                return new AgentResult(assistant.Content, step, transcript, usage);
+                var messages = await BuildPromptAsync(input, cancellationToken).ConfigureAwait(false);
+                Notify(observer => observer.OnStepStarted(step, messages));
+
+                var completion = await _model.CompleteAsync(messages, _toolDefinitions, cancellationToken)
+                    .ConfigureAwait(false);
+                usage += completion.Usage ?? default;
+                Notify(observer => observer.OnCompletionReceived(step, completion));
+
+                var assistant = ValidateModelMessage(completion.Message);
+                await AppendAsync(assistant, transcript, cancellationToken).ConfigureAwait(false);
+
+                if (assistant.ToolCalls is null || assistant.ToolCalls.Count == 0)
+                {
+                    var answer = new AgentResult(assistant.Content, step, transcript, usage);
+                    Notify(observer => observer.OnRunCompleted(answer));
+                    return answer;
+                }
+
+                var results = await ExecuteToolCallsAsync(step, assistant.ToolCalls, cancellationToken)
+                    .ConfigureAwait(false);
+                foreach (var result in results)
+                {
+                    await AppendAsync(result, transcript, cancellationToken).ConfigureAwait(false);
+                }
             }
 
-            var results = await ExecuteToolCallsAsync(assistant.ToolCalls, cancellationToken).ConfigureAwait(false);
-            foreach (var result in results)
-            {
-                await AppendAsync(result, transcript, cancellationToken).ConfigureAwait(false);
-            }
+            throw new AgentStepLimitExceededException(_options.MaxSteps);
         }
-
-        throw new AgentStepLimitExceededException(_options.MaxSteps);
+        catch (Exception ex)
+        {
+            NotifyFailed(ex);
+            throw;
+        }
     }
 
     /// <summary>
@@ -205,6 +228,12 @@ public sealed class Agent
     /// answer is appended to memory only after the stream completes; if the caller stops
     /// enumerating early or the token is cancelled, nothing is recorded for that answer.
     /// Input is validated when this method is called, not when the returned sequence is first enumerated.
+    /// <para>
+    /// Observers see the run as it happens. <see cref="IAgentObserver.OnRunCompleted"/> receives an
+    /// <see cref="AgentResult"/> built from the streamed text, and its <see cref="AgentResult.Usage"/> counts only the
+    /// completions made before the stream, because the stream reports no usage. If the caller stops enumerating
+    /// early, neither <see cref="IAgentObserver.OnRunCompleted"/> nor <see cref="IAgentObserver.OnRunFailed"/> is raised.
+    /// </para>
     /// </remarks>
     /// <param name="input">User message that starts (or continues) the conversation.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
@@ -225,46 +254,95 @@ public sealed class Agent
         string input,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        await _memory.AppendAsync(ChatMessage.User(input), cancellationToken).ConfigureAwait(false);
+        Notify(observer => observer.OnRunStarted(input));
 
+        var transcript = new List<ChatMessage>();
+        var usage = default(TokenUsage);
         IReadOnlyList<ChatMessage>? finalPrompt = null;
-        for (var step = 1; step <= _options.MaxSteps; step++)
+        var finalStep = 0;
+        try
         {
-            var messages = await BuildPromptAsync(input, cancellationToken).ConfigureAwait(false);
+            await AppendAsync(ChatMessage.User(input), transcript, cancellationToken).ConfigureAwait(false);
 
-            var completion = await _model.CompleteAsync(messages, _toolDefinitions, cancellationToken)
-                .ConfigureAwait(false);
-
-            var assistant = ValidateModelMessage(completion.Message);
-            if (assistant.ToolCalls is null || assistant.ToolCalls.Count == 0)
+            for (var step = 1; step <= _options.MaxSteps; step++)
             {
-                finalPrompt = messages;
-                break;
+                var messages = await BuildPromptAsync(input, cancellationToken).ConfigureAwait(false);
+                Notify(observer => observer.OnStepStarted(step, messages));
+
+                var completion = await _model.CompleteAsync(messages, _toolDefinitions, cancellationToken)
+                    .ConfigureAwait(false);
+                usage += completion.Usage ?? default;
+                Notify(observer => observer.OnCompletionReceived(step, completion));
+
+                var assistant = ValidateModelMessage(completion.Message);
+                if (assistant.ToolCalls is null || assistant.ToolCalls.Count == 0)
+                {
+                    finalPrompt = messages;
+                    finalStep = step;
+                    break;
+                }
+
+                await AppendAsync(assistant, transcript, cancellationToken).ConfigureAwait(false);
+
+                var results = await ExecuteToolCallsAsync(step, assistant.ToolCalls, cancellationToken)
+                    .ConfigureAwait(false);
+                foreach (var result in results)
+                {
+                    await AppendAsync(result, transcript, cancellationToken).ConfigureAwait(false);
+                }
             }
 
-            await _memory.AppendAsync(assistant, cancellationToken).ConfigureAwait(false);
-
-            var results = await ExecuteToolCallsAsync(assistant.ToolCalls, cancellationToken).ConfigureAwait(false);
-            foreach (var result in results)
+            if (finalPrompt is null)
             {
-                await _memory.AppendAsync(result, cancellationToken).ConfigureAwait(false);
+                throw new AgentStepLimitExceededException(_options.MaxSteps);
             }
         }
-
-        if (finalPrompt is null)
+        catch (Exception ex)
         {
-            throw new AgentStepLimitExceededException(_options.MaxSteps);
+            NotifyFailed(ex);
+            throw;
         }
 
+        // The loop below yields, and C# forbids yield inside a try block with a catch. The model stream is
+        // therefore advanced by hand so only MoveNextAsync sits inside a try.
         var builder = new StringBuilder();
-        await foreach (var delta in _model.StreamAsync(finalPrompt, _toolDefinitions, cancellationToken)
-            .ConfigureAwait(false))
+        await using var deltas = _model.StreamAsync(finalPrompt!, _toolDefinitions, cancellationToken)
+            .GetAsyncEnumerator(cancellationToken);
+        while (true)
         {
+            string delta;
+            try
+            {
+                if (!await deltas.MoveNextAsync().ConfigureAwait(false))
+                {
+                    break;
+                }
+
+                delta = deltas.Current;
+            }
+            catch (Exception ex)
+            {
+                NotifyFailed(ex);
+                throw;
+            }
+
             builder.Append(delta);
             yield return delta;
         }
 
-        await _memory.AppendAsync(ChatMessage.Assistant(builder.ToString()), cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var answer = builder.ToString();
+            await AppendAsync(ChatMessage.Assistant(answer), transcript, cancellationToken).ConfigureAwait(false);
+
+            var result = new AgentResult(answer, finalStep, transcript, usage);
+            Notify(observer => observer.OnRunCompleted(result));
+        }
+        catch (Exception ex)
+        {
+            NotifyFailed(ex);
+            throw;
+        }
     }
 
     private ChatMessage ValidateModelMessage(ChatMessage message)
@@ -308,6 +386,7 @@ public sealed class Agent
     }
 
     private async Task<IReadOnlyList<ChatMessage>> ExecuteToolCallsAsync(
+        int step,
         IReadOnlyList<ToolCall> calls,
         CancellationToken cancellationToken)
     {
@@ -316,24 +395,34 @@ public sealed class Agent
             var sequential = new List<ChatMessage>(calls.Count);
             foreach (var call in calls)
             {
-                sequential.Add(await ExecuteToolCallAsync(call, cancellationToken).ConfigureAwait(false));
+                sequential.Add(await ExecuteToolCallAsync(step, call, cancellationToken).ConfigureAwait(false));
             }
 
             return sequential;
         }
 
         // Task.WhenAll preserves input order in its result, so each tool message lines up with its call.
-        var tasks = calls.Select(call => ExecuteToolCallAsync(call, cancellationToken)).ToArray();
+        var tasks = calls.Select(call => ExecuteToolCallAsync(step, call, cancellationToken)).ToArray();
         return await Task.WhenAll(tasks).ConfigureAwait(false);
     }
 
-    private async Task<ChatMessage> ExecuteToolCallAsync(ToolCall call, CancellationToken cancellationToken)
+    private async Task<ChatMessage> ExecuteToolCallAsync(int step, ToolCall call, CancellationToken cancellationToken)
+    {
+        Notify(observer => observer.OnToolStarted(step, call));
+        var started = Stopwatch.GetTimestamp();
+
+        var resultText = await InvokeToolAsync(call, cancellationToken).ConfigureAwait(false);
+
+        var elapsed = Stopwatch.GetElapsedTime(started);
+        Notify(observer => observer.OnToolCompleted(step, call, resultText, elapsed));
+        return ChatMessage.ToolResult(call.Id, resultText);
+    }
+
+    private async Task<string> InvokeToolAsync(ToolCall call, CancellationToken cancellationToken)
     {
         if (!_tools.TryGetValue(call.Name, out var tool))
         {
-            return ChatMessage.ToolResult(
-                call.Id,
-                $"{ToolErrorPrefix}unknown tool '{call.Name}'. Available tools: {string.Join(", ", _tools.Keys)}");
+            return $"{ToolErrorPrefix}unknown tool '{call.Name}'. Available tools: {string.Join(", ", _tools.Keys)}";
         }
 
         var timeout = _options.ToolTimeout;
@@ -345,22 +434,40 @@ public sealed class Agent
 
         try
         {
-            var result = await tool.InvokeAsync(call.Arguments, timeoutSource.Token).ConfigureAwait(false);
-            return ChatMessage.ToolResult(call.Id, result);
+            return await tool.InvokeAsync(call.Arguments, timeoutSource.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (timeoutSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
-            return ChatMessage.ToolResult(
-                call.Id,
-                $"{ToolErrorPrefix}tool '{call.Name}' timed out after {timeout.GetValueOrDefault().TotalSeconds:0.#}s");
+            return $"{ToolErrorPrefix}tool '{call.Name}' timed out after {timeout.GetValueOrDefault().TotalSeconds:0.#}s";
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
-            return ChatMessage.ToolResult(
-                call.Id,
-                $"{ToolErrorPrefix}tool '{call.Name}' failed: {ex.GetType().Name}: {ex.Message}");
+            return $"{ToolErrorPrefix}tool '{call.Name}' failed: {ex.GetType().Name}: {ex.Message}";
         }
     }
+
+    /// <summary>
+    /// Calls one observer hook and drops any exception it throws.
+    /// </summary>
+    /// <remarks>
+    /// Observers are for diagnostics, so a failing one (a log sink that is down, a bug in a callback) must not
+    /// change what the caller sees. Without this guard, an observer exception raised inside a
+    /// <c>catch</c> block would replace the original run failure. Hooks take no cancellation token and are
+    /// synchronous, so there is no cancellation to propagate here.
+    /// </remarks>
+    private void Notify(Action<IAgentObserver> hook)
+    {
+        try
+        {
+            hook(_observer);
+        }
+        catch (Exception)
+        {
+            // Intentionally ignored; see the remarks above.
+        }
+    }
+
+    private void NotifyFailed(Exception exception) => Notify(observer => observer.OnRunFailed(exception));
 }
 
 /// <summary>
