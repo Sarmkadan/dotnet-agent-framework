@@ -133,7 +133,8 @@ public sealed class SlidingWindowAgentMemory : IAgentMemory
     {
         if (history.Count <= MaxMessages)
         {
-            return history.ToArray();
+            // Everything fits, but the cut still drops a leading tool result whose request is missing.
+            return ConversationWindow.TakeSuffixPreservingToolPairs(history, 0);
         }
 
         // A pinned system message takes one slot, so the suffix gets the rest of the budget.
