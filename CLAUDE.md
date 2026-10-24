@@ -23,6 +23,17 @@ src/dotnet-agent-framework/        library, namespace DotnetAgentFramework
   ITool.cs                          ITool, Tool<TArgs> typed base
   IAgentMemory.cs                   IAgentMemory, InMemoryAgentMemory
   Models.cs                         ChatMessage, ToolCall, ToolDefinition, ChatCompletion, AgentResult, TokenUsage
+  Memory/                           IAgentMemory implementations (namespace DotnetAgentFramework)
+    ConversationWindow.cs           internal cut logic shared by window memories (keeps tool round-trips intact)
+    SlidingWindowAgentMemory.cs     keeps the last N messages in process
+    TokenBudgetAgentMemory.cs       keeps the newest messages that fit a token budget
+    SummarizingAgentMemory.cs       folds old messages into a model-written summary
+    JsonFileAgentMemory.cs          durable JSON Lines log wrapping an inner memory; OpenAsync replays, Create does not
+  Providers/                        IChatModel adapters (namespace DotnetAgentFramework)
+    OpenAIChatModel.cs              OpenAI-compatible /chat/completions adapter (non-streaming)
+    OpenAIChatModelOptions.cs       configuration for OpenAIChatModel, validated on construction
+    OpenAIWireFormat.cs             internal framework <-> OpenAI wire-format conversions
+    SseParser.cs                    internal Server-Sent Events reader (data field only)
   Testing/ScriptedChatModel.cs      ScriptedChatModel: deterministic IChatModel for consumers' tests. Namespace
                                     DotnetAgentFramework.Testing, the ONE allowed sub-namespace (everything else is DotnetAgentFramework)
 tests/dotnet-agent-framework.Tests/ xunit, references the library
