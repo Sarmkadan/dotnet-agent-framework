@@ -58,8 +58,10 @@ public sealed class InMemoryAgentMemory : IAgentMemory
     }
 
     /// <inheritdoc />
+    /// <exception cref="ArgumentNullException"><paramref name="message"/> is <see langword="null"/>.</exception>
     public Task AppendAsync(ChatMessage message, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(message);
         cancellationToken.ThrowIfCancellationRequested();
 
         lock (_gate)
@@ -74,11 +76,14 @@ public sealed class InMemoryAgentMemory : IAgentMemory
     /// Returns a snapshot of the full history. The <paramref name="query"/> is ignored by this implementation.
     /// The returned list is a copy, so later appends or clears do not affect it.
     /// </summary>
-    /// <param name="query">Ignored by this implementation.</param>
+    /// <param name="query">Ignored by this implementation. May be empty, but not <see langword="null"/>.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>A copy of all stored messages in chronological order.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="query"/> is <see langword="null"/>.</exception>
     public Task<IReadOnlyList<ChatMessage>> RecallAsync(string query, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(query);
+
         IReadOnlyList<ChatMessage> snapshot;
 
         lock (_gate)

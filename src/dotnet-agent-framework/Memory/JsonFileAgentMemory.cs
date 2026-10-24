@@ -60,7 +60,10 @@ public sealed class JsonFileAgentMemory : IAgentMemory
     /// <param name="inner">Memory that decides what the model sees. Defaults to a new <see cref="InMemoryAgentMemory"/>.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>The opened memory, with every stored message replayed into <paramref name="inner"/>.</returns>
-    /// <exception cref="ArgumentException"><paramref name="filePath"/> is empty or whitespace.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="filePath"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="filePath"/> is empty, whitespace, or contains characters that are invalid in a path.
+    /// </exception>
     /// <exception cref="InvalidDataException">A non-empty line in the file is not a valid <see cref="ChatMessage"/>.</exception>
     public static async Task<JsonFileAgentMemory> OpenAsync(
         string filePath,
@@ -79,15 +82,25 @@ public sealed class JsonFileAgentMemory : IAgentMemory
     /// <param name="filePath">Path of the JSON Lines file. The file is created on the first append.</param>
     /// <param name="inner">Memory that decides what the model sees. Defaults to a new <see cref="InMemoryAgentMemory"/>.</param>
     /// <returns>The memory.</returns>
-    /// <exception cref="ArgumentException"><paramref name="filePath"/> is empty or whitespace.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="filePath"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="filePath"/> is empty, whitespace, or contains characters that are invalid in a path.
+    /// </exception>
     public static JsonFileAgentMemory Create(string filePath, IAgentMemory? inner = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+
+        if (filePath.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
+        {
+            throw new ArgumentException("The path contains characters that are invalid in a file path.", nameof(filePath));
+        }
 
         return new(filePath, inner ?? new InMemoryAgentMemory());
     }
 
     /// <inheritdoc />
+    /// <exception cref="ArgumentNullException"><paramref name="message"/> is <see langword="null"/>.</exception>
+    /// <exception cref="IOException">The line could not be written to the file. The message is already in <c>inner</c>.</exception>
     public async Task AppendAsync(ChatMessage message, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(message);
@@ -109,11 +122,16 @@ public sealed class JsonFileAgentMemory : IAgentMemory
     /// <summary>
     /// Forwards to <c>inner</c>. The file is not read here.
     /// </summary>
-    /// <param name="query">Passed through to <c>inner</c>.</param>
+    /// <param name="query">Passed through to <c>inner</c>. May be empty, but not <see langword="null"/>.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>The window that <c>inner</c> returns.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="query"/> is <see langword="null"/>.</exception>
     public Task<IReadOnlyList<ChatMessage>> RecallAsync(string query, CancellationToken cancellationToken = default)
-        => _inner.RecallAsync(query, cancellationToken);
+    {
+        ArgumentNullException.ThrowIfNull(query);
+
+        return _inner.RecallAsync(query, cancellationToken);
+    }
 
     /// <inheritdoc />
     public async Task ClearAsync(CancellationToken cancellationToken = default)

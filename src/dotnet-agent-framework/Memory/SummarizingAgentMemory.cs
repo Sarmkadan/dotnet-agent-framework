@@ -69,12 +69,14 @@ public sealed class SummarizingAgentMemory : IAgentMemory
     /// </param>
     /// <param name="counter">Estimator used to measure messages. Defaults to <see cref="ApproximateTokenCounter"/>.</param>
     /// <param name="summaryPrompt">
-    /// System instruction for the summarizer. Defaults to <see cref="DefaultSummaryPrompt"/>.
+    /// System instruction for the summarizer. Pass <see langword="null"/> to use <see cref="DefaultSummaryPrompt"/>.
+    /// Otherwise it must not be empty or whitespace.
     /// </param>
     /// <exception cref="ArgumentNullException"><paramref name="summarizer"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentOutOfRangeException">
     /// <paramref name="maxTokens"/> is less than 1, or <paramref name="keepRecentMessages"/> is negative.
     /// </exception>
+    /// <exception cref="ArgumentException"><paramref name="summaryPrompt"/> is empty or whitespace.</exception>
     public SummarizingAgentMemory(
         IChatModel summarizer,
         int maxTokens,
@@ -85,6 +87,11 @@ public sealed class SummarizingAgentMemory : IAgentMemory
         ArgumentNullException.ThrowIfNull(summarizer);
         ArgumentOutOfRangeException.ThrowIfLessThan(maxTokens, 1);
         ArgumentOutOfRangeException.ThrowIfNegative(keepRecentMessages);
+
+        if (summaryPrompt is not null)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(summaryPrompt);
+        }
 
         _summarizer = summarizer;
         _maxTokens = maxTokens;
@@ -104,6 +111,8 @@ public sealed class SummarizingAgentMemory : IAgentMemory
     public int RecentCount => _recent.Count;
 
     /// <inheritdoc />
+    /// <exception cref="ArgumentNullException"><paramref name="message"/> is <see langword="null"/>.</exception>
+    /// <exception cref="InvalidOperationException">Summarization was needed and the summarizer failed.</exception>
     public async Task AppendAsync(ChatMessage message, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(message);
@@ -133,9 +142,17 @@ public sealed class SummarizingAgentMemory : IAgentMemory
         }
     }
 
-    /// <inheritdoc />
+    /// <summary>
+    /// Returns the summary, if any, followed by the verbatim recent messages. The <paramref name="query"/> is ignored by this implementation.
+    /// </summary>
+    /// <param name="query">Ignored by this implementation. May be empty, but not <see langword="null"/>.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A copy of the window in chronological order.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="query"/> is <see langword="null"/>.</exception>
     public async Task<IReadOnlyList<ChatMessage>> RecallAsync(string query, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(query);
+
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {

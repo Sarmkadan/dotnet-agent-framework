@@ -85,6 +85,7 @@ public sealed class SlidingWindowAgentMemory : IAgentMemory
     }
 
     /// <inheritdoc />
+    /// <exception cref="ArgumentNullException"><paramref name="message"/> is <see langword="null"/>.</exception>
     public Task AppendAsync(ChatMessage message, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(message);
@@ -101,11 +102,13 @@ public sealed class SlidingWindowAgentMemory : IAgentMemory
     /// <summary>
     /// Returns the sliding window over the stored history. The <paramref name="query"/> is ignored by this implementation.
     /// </summary>
-    /// <param name="query">Ignored by this implementation.</param>
+    /// <param name="query">Ignored by this implementation. May be empty, but not <see langword="null"/>.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>A copy of the window in chronological order. The list is not affected by later appends or clears.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="query"/> is <see langword="null"/>.</exception>
     public Task<IReadOnlyList<ChatMessage>> RecallAsync(string query, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(query);
         cancellationToken.ThrowIfCancellationRequested();
 
         IReadOnlyList<ChatMessage> window;
