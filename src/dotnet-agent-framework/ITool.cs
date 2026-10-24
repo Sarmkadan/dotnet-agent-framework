@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace DotnetAgentFramework;
 
@@ -34,7 +35,11 @@ public interface ITool
 public abstract class Tool<TArgs> : ITool
     where TArgs : class
 {
-    private static readonly JsonSerializerOptions s_jsonOptions = new(JsonSerializerDefaults.Web);
+    // Enums are advertised as string names by JsonSchemaGenerator, so they must also be read from strings.
+    private static readonly JsonSerializerOptions s_jsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        Converters = { new JsonStringEnumConverter() },
+    };
 
     // Per closed generic type, so reflection runs once for each TArgs.
     private static readonly Lazy<JsonElement> s_schema = new(() => JsonSchemaGenerator.Generate(typeof(TArgs)));
